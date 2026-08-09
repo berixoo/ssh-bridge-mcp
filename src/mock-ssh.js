@@ -70,6 +70,7 @@ function createMockClientFactory({ onExec, onSftp } = {}) {
       client.calls.push({ type: 'sftp' });
       cb(null, onSftp ? onSftp() : makeSftp());
     };
+    client.connect = () => {};
     client.end = () => client.emit('close');
     setImmediate(() => client.emit('ready'));
     return client;
