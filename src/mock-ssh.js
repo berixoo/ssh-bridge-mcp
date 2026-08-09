@@ -2,7 +2,7 @@ const { EventEmitter } = require('events');
 const path = require('path');
 
 function makeChannel(res = {}) {
-  const { code = 0, stdout = '', stderr = '', onWrite, _neverClose } = res;
+  const { code = 0, stdout = '', stderr = '', onWrite, _neverClose, _drop } = res;
   const ch = new EventEmitter();
   ch.stderr = new EventEmitter();
   ch.setWindow = () => {};
@@ -16,10 +16,20 @@ function makeChannel(res = {}) {
       return true;
     },
   };
+  // stdout/stderr may be a string or an array of chunks; each element is
+  // emitted as its own data event so accumulation and capping are exercised.
+  const outChunks = Array.isArray(stdout) ? stdout : stdout ? [stdout] : [];
+  const errChunks = Array.isArray(stderr) ? stderr : stderr ? [stderr] : [];
   setImmediate(() => {
     ch.emit('ready');
-    if (stdout) ch.emit('data', Buffer.from(stdout));
-    if (stderr) ch.stderr.emit('data', Buffer.from(stderr));
+    if (_drop) {
+      // Mid-command connection loss: error, then close without a code.
+      ch.emit('error', new Error('mock connection reset'));
+      ch.emit('close');
+      return;
+    }
+    for (const c of outChunks) ch.emit('data', Buffer.from(c));
+    for (const c of errChunks) ch.stderr.emit('data', Buffer.from(c));
     if (!_neverClose) ch.emit('close', code);
   });
   return ch;
@@ -88,7 +98,7 @@ function makeSftp() {
 }
 
 function createMockClientFactory({ onExec, onSftp } = {}) {
-  return function factory() {
+  function factory() {
     const client = new EventEmitter();
     client.calls = [];
     client.exec = (command, opts, cb) => {
@@ -98,16 +108,22 @@ function createMockClientFactory({ onExec, onSftp } = {}) {
       const ch = makeChannel(res);
       client._lastChannel = ch;
       cb(null, ch);
+      if (res._drop) setImmediate(() => client.emit('close'));
     };
     client.sftp = (cb) => {
       client.calls.push({ type: 'sftp' });
-      cb(null, onSftp ? onSftp() : makeSftp());
+      const s = onSftp ? onSftp() : makeSftp();
+      client._sftp = s;
+      cb(null, s);
     };
     client.connect = () => {};
     client.end = () => client.emit('close');
     setImmediate(() => client.emit('ready'));
+    factory._clients.push(client);
     return client;
-  };
+  }
+  factory._clients = [];
+  return factory;
 }
 
 module.exports = { createMockClientFactory, makeSftp };

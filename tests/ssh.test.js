@@ -1,6 +1,6 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { createBridge } = require('../src/ssh');
+const { createBridge, makeExecCommand, MAX_OUTPUT } = require('../src/ssh');
 const { createMockClientFactory, makeSftp } = require('../src/mock-ssh');
 
 const cfg = {
@@ -23,11 +23,19 @@ test('runCommand returns exit code, stdout, stderr', async () => {
   assert.deepEqual(r, { exitCode: 1, stdout: 'out', stderr: 'err', timedOut: false, truncated: false });
 });
 
-test('runCommand prefixes cwd and wraps sudo with sh -c', async () => {
+test('runCommand wraps with setsid, captures pid, and applies sudo/cwd payload', async () => {
   let seen;
   const b = makeBridge({ onExec: (cmd) => { seen = cmd; return { code: 0 }; } });
   await b.runCommand('dev', { command: "apt install 'pkg'", cwd: '/app', sudo: true });
-  assert.equal(seen, "cd '/app' && sudo -S -p '' sh -c 'apt install '\\''pkg'\\'''");
+  assert.ok(seen.startsWith('setsid bash -c '), `expected setsid wrapper, got: ${seen}`);
+  const pidM = seen.match(/\/tmp\/ssh-bridge-pid-([a-f0-9]+);/);
+  assert.ok(pidM, 'expected pid capture');
+  // Rebuild the expected command from the same pieces as the implementation
+  // and compare after normalizing the random pid.
+  const inner = makeExecCommand({ command: "apt install 'pkg'", cwd: '/app', sudo: true });
+  const shq = (s) => "'" + s.replace(/'/g, `'\\''`) + "'";
+  const expected = `setsid bash -c ${shq(`echo $$ > /tmp/ssh-bridge-pid-<PID>;\n${inner}`)}`.replace('<PID>', pidM[1]);
+  assert.equal(seen, expected);
 });
 
 test('runCommand passes env option to exec', async () => {
@@ -51,6 +59,65 @@ test('runCommand reports timeout', async () => {
   assert.equal(r.timedOut, true);
   assert.ok(Date.now() - start < 3000);
 });
+
+test('runCommand rejects when connection drops mid-command and pool rebuilds', async () => {
+  const factory = createMockClientFactory({ onExec: () => ({ _drop: true }) });
+  const b = createBridge(cfg, { clientFactory: factory });
+  await assert.rejects(b.runCommand('dev', { command: 'sleep' }), /connection closed before command completed/);
+  // Let the mock's client-close flush so the pool evicts the dead connection.
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(factory._clients.length, 1);
+  await assert.rejects(b.runCommand('dev', { command: 'sleep' }), /connection closed before command completed/);
+  assert.equal(factory._clients.length, 2, 'pool must rebuild a fresh connection');
+});
+
+test('runCommand kills the process group on timeout', async () => {
+  const kills = [];
+  const b = makeBridge({
+    onExec: (cmd) => {
+      if (cmd.startsWith('kill -TERM -- -')) { kills.push(cmd); return { code: 0 }; }
+      return { _neverClose: true };
+    },
+  });
+  const r = await b.runCommand('dev', { command: 'sleep', timeoutMs: 50, cwd: '/app' });
+  assert.equal(r.timedOut, true);
+  assert.ok(
+    kills.some((k) => /kill -TERM -- -\$\(cat \/tmp\/ssh-bridge-pid-[a-f0-9]+\)/.test(k)),
+    `expected a process-group kill, got: ${kills.join(' | ')}`
+  );
+});
+
+test('runCommand caps accumulated output at MAX_OUTPUT', async () => {
+  const chunk = 'x'.repeat(51200);
+  const chunks = new Array(20).fill(chunk); // 1MB total
+  const b = makeBridge({ onExec: () => ({ code: 0, stdout: chunks }) });
+  const r = await b.runCommand('dev', { command: 'yes' });
+  assert.equal(r.stdout.length, MAX_OUTPUT);
+  assert.equal(r.truncated, true);
+  assert.equal(r.exitCode, 0);
+});
+
+test('backgroundLogs resets offset when the log file is truncated', async () => {
+  const sftp = makeSftp();
+  const b = makeBridge({
+    onSftp: () => sftp,
+    onExec: (cmd) => {
+      if (cmd.includes('kill -0')) return { code: 1 }; // 进程已死（kill 失败）
+      if (cmd.startsWith('cat ')) return { code: 0, stdout: '12345\n' };
+      return { code: 0, stdout: '12345\n' };
+    },
+  });
+  const { taskId } = await b.startBackground('dev', { command: 'echo hi', cwd: '/app' });
+  const outFile = `/tmp/ssh-bridge-${taskId}.out`;
+  sftp._files.set(outFile, Buffer.from('abcdef'));
+  const first = await b.backgroundLogs(taskId);
+  assert.equal(first.content, 'abcdef');
+  // Simulate rotation: the file shrinks below the stored offset.
+  sftp._files.set(outFile, Buffer.from('xyz'));
+  const second = await b.backgroundLogs(taskId);
+  assert.equal(second.content, 'xyz', 'offset must reset when the file shrank');
+});
+
 
 test('readFile returns content', async () => {
   const sftp = makeSftp();
