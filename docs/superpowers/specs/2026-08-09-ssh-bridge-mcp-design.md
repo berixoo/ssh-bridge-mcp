@@ -42,11 +42,11 @@ Claude Desktop / Claude Code / Codex
   "default": "dev01",
   "hosts": {
     "dev01": {
-      "host": "192.168.1.10",
+      "host": "<remote-host-ip>",
       "port": 22,
-      "user": "roooi",
-      "password": "...",
-      "sudoPassword": "..."
+      "user": "<username>",
+      "password": "<ssh-password>",
+      "sudoPassword": "<sudo-password>"
     }
   }
 }

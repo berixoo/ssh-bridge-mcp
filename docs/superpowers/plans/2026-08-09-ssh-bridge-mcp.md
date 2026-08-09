@@ -68,11 +68,11 @@ config.json
   "default": "dev01",
   "hosts": {
     "dev01": {
-      "host": "192.168.1.10",
+      "host": "<remote-host-ip>",
       "port": 22,
-      "user": "roooi",
-      "password": "your-ssh-password",
-      "sudoPassword": "your-sudo-password"
+      "user": "<username>",
+      "password": "<ssh-password>",
+      "sudoPassword": "<sudo-password>"
     }
   }
 }
@@ -80,7 +80,7 @@ config.json
 
 - [ ] **Step 4: 安装依赖并验证**
 
-Run: `cd C:/workspace/MCP/ssh-bridge-mcp && npm install`
+Run: `cd <repo-path>/ssh-bridge-mcp && npm install`
 Expected: 安装成功。再跑 `node -e "require('ssh2'); require('@modelcontextprotocol/sdk/server/mcp.js'); console.log('ok')"`，输出 `ok`。
 
 - [ ] **Step 5: Commit**
@@ -985,7 +985,7 @@ git commit -m "feat: MCP server with 9 tools"
   "mcpServers": {
     "ssh-bridge": {
       "command": "node",
-      "args": ["C:/workspace/MCP/ssh-bridge-mcp/src/server.js"]
+      "args": ["<path-to>/ssh-bridge-mcp/src/server.js"]
     }
   }
 }
@@ -994,7 +994,7 @@ git commit -m "feat: MCP server with 9 tools"
 ### Claude Code
 
 ```bash
-claude mcp add ssh-bridge -- node C:/workspace/MCP/ssh-bridge-mcp/src/server.js
+claude mcp add ssh-bridge -- node <path-to>/ssh-bridge-mcp/src/server.js
 ```
 
 ## 工具

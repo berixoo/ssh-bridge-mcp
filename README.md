@@ -22,11 +22,11 @@ Claude Desktop / Claude Code / Codex
      "default": "dev01",
      "hosts": {
        "dev01": {
-         "host": "192.168.1.10",
+         "host": "<remote-host-ip>",
          "port": 22,
-         "user": "roooi",
-         "password": "...",
-         "sudoPassword": "..."
+         "user": "<username>",
+         "password": "<ssh-password>",
+         "sudoPassword": "<sudo-password>"
        }
      }
    }
@@ -47,7 +47,7 @@ Claude Desktop / Claude Code / Codex
   "mcpServers": {
     "ssh-bridge": {
       "command": "node",
-      "args": ["C:/workspace/MCP/ssh-bridge-mcp/src/server.js"]
+      "args": ["<path-to>/ssh-bridge-mcp/src/server.js"]
     }
   }
 }
@@ -56,7 +56,7 @@ Claude Desktop / Claude Code / Codex
 ### Claude Code
 
 ```bash
-claude mcp add ssh-bridge -- node C:/workspace/MCP/ssh-bridge-mcp/src/server.js
+claude mcp add ssh-bridge -- node <path-to>/ssh-bridge-mcp/src/server.js
 ```
 
 ## 工具
@@ -130,7 +130,5 @@ claude mcp add ssh-bridge -- node C:/workspace/MCP/ssh-bridge-mcp/src/server.js
 ## 测试
 
 ```bash
-node --test "tests/*.test.js"
+npm test
 ```
-
-（不用 `npm test`：`node --test tests/` 目录参数在当前 Node 版本下行为异常，直接用 glob 传测试文件。）
