@@ -34,8 +34,16 @@ test('runCommand wraps with setsid, captures pid, and applies sudo/cwd payload',
   // and compare after normalizing the random pid.
   const inner = makeExecCommand({ command: "apt install 'pkg'", cwd: '/app', sudo: true });
   const shq = (s) => "'" + s.replace(/'/g, `'\\''`) + "'";
-  const expected = `setsid bash -c ${shq(`echo $$ > /tmp/ssh-bridge-pid-<PID>;\n${inner}`)}`.replace('<PID>', pidM[1]);
+  const capture = `echo $$ > /tmp/ssh-bridge-pid-<PID>; trap 'rm -f /tmp/ssh-bridge-pid-<PID>' EXIT;\n`;
+  const expected = `setsid bash -c ${shq(capture + inner)}`.replace(/<PID>/g, pidM[1]);
   assert.equal(seen, expected);
+});
+
+test('runCommand does not wrap pty commands in setsid', async () => {
+  let seen;
+  const b = makeBridge({ onExec: (cmd) => { seen = cmd; return { code: 0 }; } });
+  await b.runCommand('dev', { command: 'vim', pty: true, cwd: '/app' });
+  assert.equal(seen, "cd '/app' && vim", `pty commands must not be setsid-wrapped, got: ${seen}`);
 });
 
 test('runCommand passes env option to exec', async () => {

@@ -104,19 +104,26 @@ function createBridge(cfg, { clientFactory = () => new Client() } = {}) {
   }
 
   function execChannel(client, { command, cwd, timeoutMs, sudo, pty, env, input, sudoPassword }) {
-    const wrap = pty || sudo || cwd;
+    // pty commands are already made session/process-group leaders by the SSH
+    // server (setsid + TIOCSCTTY on the pty), so wrapping them in setsid again
+    // would fail with EPERM on real OpenSSH. Only non-pty commands with a
+    // sudo/cwd wrapper get the setsid + pidFile treatment; pty timeouts keep
+    // the original ch.signal('SIGKILL') behavior (top shell only).
+    const wrap = !pty && (sudo || cwd);
     const pidFile = wrap ? `/tmp/ssh-bridge-pid-${crypto.randomBytes(6).toString('hex')}` : null;
     let full;
     if (wrap) {
       // setsid detaches the command into its own session, making it the
       // session leader whose PID equals the process-group id. The child pid is
       // captured to a file so a timeout can signal the whole tree via
-      // kill(-pgid). makeExecCommand still applies sudo/cwd around the payload.
+      // kill(-pgid); the EXIT trap removes the pid file on normal completion.
       const inner = makeExecCommand({ command, cwd, sudo });
-      const capture = pidFile ? `echo $$ > ${pidFile};\n` : '';
+      const capture = `echo $$ > ${pidFile}; trap 'rm -f ${pidFile}' EXIT;\n`;
       full = `setsid bash -c ${shq(capture + inner)}`;
     } else {
-      full = command;
+      // Non-wrapped path (plain or pty): apply cwd/sudo exactly as before the
+      // setsid change, and let pty timeouts use ch.signal('SIGKILL').
+      full = makeExecCommand({ command, cwd, sudo });
     }
     const opts = {};
     if (pty) opts.pty = { rows: 40, cols: 200, term: 'xterm-256color' };
