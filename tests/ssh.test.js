@@ -70,11 +70,44 @@ test('writeFile mkdirs parent then writes', async () => {
 test('upload calls fastPut after mkdir', async () => {
   const sftp = makeSftp();
   let mkdirs = [];
-  sftp.mkdir = (p, opts, cb) => { mkdirs.push(p); cb(null); };
+  sftp.mkdir = (p, opts, cb) => {
+    if (typeof opts === 'function') { cb = opts; opts = {}; }
+    mkdirs.push(p);
+    const parent = require('path').posix.dirname(p);
+    if (!sftp._files.has(parent)) { const e = new Error('ENOENT'); e.code = 2; return cb(e); }
+    sftp._files.set(p, null);
+    cb(null);
+  };
   const b = makeBridge({ onSftp: () => sftp });
   await b.upload('dev', 'C:\\tmp\\x.txt', '/r/d/x.txt');
-  assert.deepEqual(mkdirs, ['/r/d']);
+  assert.deepEqual(mkdirs, ['/r', '/r/d']);
   assert.ok(sftp._files.has('/r/d/x.txt'));
+});
+
+test('writeFile creates missing nested parents', async () => {
+  const sftp = makeSftp();
+  const b = makeBridge({ onSftp: () => sftp });
+  await b.writeFile('dev', '/a/b/c.txt', 'content');
+  assert.equal(sftp._files.get('/a/b/c.txt').toString(), 'content');
+  assert.equal(sftp._files.get('/a'), null);
+  assert.equal(sftp._files.get('/a/b'), null);
+});
+
+test('mkdirp skips creation for existing parent dirs', async () => {
+  const sftp = makeSftp();
+  let mkdirs = [];
+  const origMkdir = sftp.mkdir;
+  sftp.mkdir = (p, opts, cb) => {
+    if (typeof opts === 'function') { cb = opts; opts = {}; }
+    mkdirs.push(p);
+    origMkdir(p, opts, cb);
+  };
+  sftp._files.set('/a', null);
+  sftp._files.set('/a/b', null);
+  const b = makeBridge({ onSftp: () => sftp });
+  await b.writeFile('dev', '/a/b/f.txt', 'content');
+  assert.deepEqual(mkdirs, []);
+  assert.equal(sftp._files.get('/a/b/f.txt').toString(), 'content');
 });
 
 test('startBackground then backgroundLogs then stopBackground', async () => {

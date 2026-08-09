@@ -26,6 +26,25 @@ function cap(s) {
   return { text: s.slice(0, MAX_OUTPUT), truncated: s.length > MAX_OUTPUT };
 }
 
+// ssh2 mkdir(path, attrs, cb) has no recursive option, so ensure each
+// missing level explicitly. Any stat error is treated as "does not exist",
+// then each level is created while ignoring EEXIST (ssh2 status code 4).
+// The root "/" is always assumed to exist and is never created.
+function mkdirp(sftp, dir) {
+  return new Promise((resolve, reject) => {
+    if (dir === '/' || dir === '') return resolve();
+    sftp.stat(dir, (e) => {
+      if (!e) return resolve();
+      const parent = path.posix.dirname(dir);
+      if (parent === '/' || parent === dir) return mkdirNow();
+      mkdirp(sftp, parent).then(mkdirNow, reject);
+    });
+    function mkdirNow() {
+      sftp.mkdir(dir, (e2) => (e2 && e2.code !== 4 ? reject(e2) : resolve()));
+    }
+  });
+}
+
 function createBridge(cfg, { clientFactory = () => new Client() } = {}) {
   const conns = new Map();
   const tasks = new Map();
@@ -141,9 +160,7 @@ function createBridge(cfg, { clientFactory = () => new Client() } = {}) {
 
   async function writeRemoteFile(sftp, file, content) {
     const dir = path.posix.dirname(file);
-    await new Promise((resolve, reject) =>
-      sftp.mkdir(dir, { recursive: true }, (e) => (e ? reject(e) : resolve()))
-    );
+    await mkdirp(sftp, dir);
     await new Promise((resolve, reject) =>
       sftp.writeFile(file, content, (e) =>
         e ? reject(new Error(`write_file ${file}: ${e.message}`)) : resolve()
@@ -159,9 +176,7 @@ function createBridge(cfg, { clientFactory = () => new Client() } = {}) {
 
   async function upload(name, localPath, remotePath) {
     const s = await getSftp(name);
-    await new Promise((resolve, reject) =>
-      s.mkdir(path.posix.dirname(remotePath), { recursive: true }, (e) => (e ? reject(e) : resolve()))
-    );
+    await mkdirp(s, path.posix.dirname(remotePath));
     await new Promise((resolve, reject) =>
       s.fastPut(localPath, remotePath, (e) =>
         e ? reject(new Error(`upload: ${e.message}`)) : resolve()

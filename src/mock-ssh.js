@@ -1,4 +1,5 @@
 const { EventEmitter } = require('events');
+const path = require('path');
 
 function makeChannel(res = {}) {
   const { code = 0, stdout = '', stderr = '', onWrite, _neverClose } = res;
@@ -26,14 +27,38 @@ function makeChannel(res = {}) {
 
 function makeSftp() {
   const files = new Map();
+  files.set('/', null); // root always exists, like a real filesystem
   return {
     _files: files,
-    mkdir: (p, opts, cb) => { if (typeof opts === 'function') { cb = opts; opts = {}; } cb(null); },
+    // Single-level semantics: mirror ssh2's non-recursive mkdir(path, attrs, cb).
+    mkdir: (p, opts, cb) => {
+      if (typeof opts === 'function') { cb = opts; opts = {}; }
+      const parent = path.posix.dirname(p);
+      if (!files.has(parent)) {
+        const e = new Error(`ENOENT: no such file or directory: ${parent}`);
+        e.code = 2;
+        return cb(e);
+      }
+      files.set(p, null); // null marks a directory
+      cb(null);
+    },
+    stat: (p, cb) => {
+      if (!files.has(p)) {
+        const e = new Error(`ENOENT: no such file or directory: ${p}`);
+        e.code = 2;
+        return cb(e);
+      }
+      cb(null, { size: files.get(p) === null ? 0 : (files.get(p) || Buffer.alloc(0)).length });
+    },
     writeFile: (p, data, cb) => { files.set(p, Buffer.from(data)); cb(null); },
     readFile: (p, enc, cb) => {
       if (typeof enc === 'function') { cb = enc; enc = 'utf8'; }
       const b = files.get(p);
-      if (!b) return cb(new Error(`ENOENT: ${p}`));
+      if (b === undefined || b === null) {
+        const e = new Error(`ENOENT: ${p}`);
+        e.code = 2;
+        return cb(e);
+      }
       cb(null, enc === 'utf8' ? b.toString('utf8') : b);
     },
     fastPut: (lp, rp, cb) => { files.set(rp, Buffer.from(String(lp))); cb(null); },
@@ -42,7 +67,15 @@ function makeSftp() {
       files.set(String(lp), files.get(rp));
       cb(null);
     },
-    open: (p, _mode, cb) => cb(null, { _p: p }),
+    open: (p, _mode, cb) => {
+      const v = files.get(p);
+      if (v === undefined || v === null) {
+        const e = new Error(`ENOENT: ${p}`);
+        e.code = 2;
+        return cb(e);
+      }
+      cb(null, { _p: p });
+    },
     fstat: (h, cb) => cb(null, { size: (files.get(h._p) || Buffer.alloc(0)).length }),
     read: (h, buf, start, len, pos, cb) => {
       const b = files.get(h._p) || Buffer.alloc(0);
