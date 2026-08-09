@@ -549,6 +549,7 @@ function createBridge(cfg, { clientFactory = () => new Client() } = {}) {
         const timer = setTimeout(() => {
           timedOut = true;
           ch.signal('SIGKILL');
+          finish();
         }, timeout);
         const finish = () => {
           if (done) return;
@@ -725,22 +726,9 @@ function createBridge(cfg, { clientFactory = () => new Client() } = {}) {
 module.exports = { createBridge, makeExecCommand, stripAnsi };
 ```
 
-- [ ] **Step 4: 修复测试里的超时用例**
+- [ ] **Step 4: 验证超时用例**
 
-mock `makeChannel` 目前固定会 emit `close`，无法表达「永不返回」的场景。给 `makeChannel` 加一个 `_neverClose` 支持：
-
-Modify `src/mock-ssh.js` 的 `makeChannel` 尾部：
-
-```js
-  setImmediate(() => {
-    ch.emit('ready');
-    if (stdout) ch.emit('data', Buffer.from(stdout));
-    if (stderr) ch.stderr.emit('data', Buffer.from(stderr));
-    if (!res._neverClose) ch.emit('close', code);
-  });
-```
-
-然后简化测试里的 timeout 用例：
+mock 的 `_neverClose` 支持已在 Task 3 写入 `makeChannel`（`if (!_neverClose) ch.emit('close', code)`），无需修改。直接确认测试文件里的 timeout 用例为：
 
 ```js
 test('runCommand reports timeout', async () => {
