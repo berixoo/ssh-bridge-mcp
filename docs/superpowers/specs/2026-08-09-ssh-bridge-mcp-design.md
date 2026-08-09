@@ -92,7 +92,7 @@ Claude Desktop / Claude Code / Codex
 
 - 配置文件内容在工具输出中**永不出现**。
 - SSH 连接错误信息剥离凭据。
-- 配置文件放 `~/.claude/.mcp/` 下，server 进程能读，LLM 读不到。
+- 配置文件放项目根目录 `config.json`（可用环境变量 `SSH_BRIDGE_CONFIG` 指定路径），server 进程能读，LLM 读不到。
 - 自用局域网场景，不做过度加密。
 
 ## 错误处理
