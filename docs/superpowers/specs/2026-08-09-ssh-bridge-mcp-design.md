@@ -1,0 +1,114 @@
+# SSH Bridge MCP — 设计文档
+
+日期：2026-08-09
+
+## 背景与目标
+
+开发工作一部分在物理机（Windows），一部分在局域网内的一台或多台 Linux（物理机或虚拟机）上。为了让 Claude Code、Codex、Claude Desktop 等本机 agent 能统一、可靠地操作远程 Linux 进行项目开发（上传下载文件、代码开发、运行部署、git 协作），需要一个 MCP server 把 SSH 封装成结构化工具。
+
+### 要解决的问题
+
+- 本机 agent 手工拼 `ssh user@ip "cmd"` 命令经常出现引号转义、管道、sudo 处理等拼接错误。
+- Claude Desktop 没有 SSH / 文件系统能力，唯一的扩展通道是 MCP。
+- 多客户端（Claude Code / Codex / Claude Desktop）希望统一连到同一组 Linux，行为一致，凭据集中管理。
+
+## 架构
+
+```
+Claude Desktop / Claude Code / Codex
+        │  MCP (stdio/HTTP)
+        ▼
+本机 Windows 上运行的 MCP server (Node + @modelcontextprotocol/sdk + ssh2)
+        │  SSH（密码来自本地配置）
+        ▼
+多台远程 Linux（配置文件里列出）
+```
+
+- Server 常驻本机，配置在本地。
+- **LLM 侧永远只看到工具与输出，看不到配置文件、看不到密码** —— 密码由 server 自己持有，绝不作为工具参数出现。
+- 文件传输走 SFTP，不经过 shell，杜绝引号/转义错误。
+
+## 技术栈
+
+- Node.js + 官方 `@modelcontextprotocol/sdk`（与 mimo-search 同模式）
+- `ssh2` 库：SSH/SFTP/PTY 支持成熟，是事实标准
+- `zod`：参数校验
+- 无构建步骤，纯 JS
+
+## 配置（config.json）
+
+```json
+{
+  "default": "dev01",
+  "hosts": {
+    "dev01": {
+      "host": "192.168.1.10",
+      "port": 22,
+      "user": "roooi",
+      "password": "...",
+      "sudoPassword": "..."
+    }
+  }
+}
+```
+
+- 主机名是 agent 调用工具时的唯一标识。
+- `default` 指定缺省主机，允许工具调用省略 `host` 参数。
+- `sudoPassword` 可选，缺省与 `password` 相同。
+- 配置文件名/内容在工具输出中**永不出现**。
+- 建议 `chmod 600`，字段名固定（`password` / `sudoPassword`），不做加密（局域网自用）。
+
+## 工具面
+
+### 连接与基础（`host` 参数可选，缺省连默认主机）
+
+- `list_hosts()` — 列出可用主机名及地址（不含任何凭据）
+
+- `run_command(host, command, cwd, timeout_ms, sudo, pty)` — 核心工具
+  - `sudo=true` 时自动用 `sudo -S` 喂密码
+  - `pty=true` 时在 PTY 下执行（支持 npm、python -i 等交互命令）
+  - 返回 `{ exitCode, stdout, stderr }`
+
+### 文件（全部走 SFTP，不经 shell）
+
+- `read_file(host, path)` — 读远程文本文件
+- `write_file(host, path, content)` — 写远程文本文件（自动建目录）
+- `upload(host, local_path, remote_path)` — 本机 → Linux
+- `download(host, remote_path, local_path)` — Linux → 本机
+
+### 后台进程
+
+- `start_background(host, command, cwd)` — 启动长驻进程（dev server、训练任务），返回 `task_id`
+- `background_logs(task_id, tail)` — 读后台进程日志（增量，从上次读的位置起）
+- `stop_background(task_id)` — 终止进程
+
+## 关键行为
+
+- **命令失败**返回真实 exit code，不抛异常；命令超时返回 timeout 状态。
+- **后台进程**：server 端维护 `task_id → { conn, channel, buffer }` 映射，日志按行缓冲，`background_logs` 返回增量。`stop_background` 发 SIGKILL。server 重启后后台进程清理，不跨重启恢复。
+- **连接池**：每个 host 维护一个可复用的连接（失败自动重建），多 host 并行；`background_logs` / `stop_background` 必须命中同一连接。
+
+## 安全
+
+- 配置文件内容在工具输出中**永不出现**。
+- SSH 连接错误信息剥离凭据。
+- 配置文件放 `~/.claude/.mcp/` 下，server 进程能读，LLM 读不到。
+- 自用局域网场景，不做过度加密。
+
+## 错误处理
+
+- 连接失败 / 认证失败 → 清晰报错，不泄漏密码。
+- 每个工具在 server 侧 catch，返回结构化错误而非崩掉。
+
+## 测试
+
+- `scripts/self-check.mjs` 用 assert 验证核心逻辑。
+- 每个非平凡逻辑留一个可运行的检查。
+
+## 明确的非目标（YAGNI）
+
+- 不专门做 git 工具 —— 用 `run_command` 跑 `git` 即可。
+- 不专门做部署工具 —— 同理由 `run_command` 覆盖。
+- 不做持久交互会话（start_session / send_input）—— 由 pty 标志 + 后台进程覆盖。
+- 不做跨 server 重启的后台进程恢复。
+- 不做凭据加密存储。
