@@ -25,7 +25,7 @@ server.registerTool('run_command', {
     host: hostSchema,
     command: z.string().min(1),
     cwd: z.string().optional().describe('working directory; cd before command'),
-    timeoutMs: z.number().int().min(1).max(600000).optional().describe('default 30000'),
+    timeout_ms: z.number().int().min(1).max(600000).optional().describe('default 30000'),
     sudo: z.boolean().optional().default(false),
     pty: z.boolean().optional().default(false),
     env: z.record(z.string(), z.string()).optional(),
@@ -33,7 +33,12 @@ server.registerTool('run_command', {
   },
 }, async (args) => {
   try {
-    return ok(await bridge.runCommand(args.host, args));
+    const bridgeArgs = { ...args };
+    if (args.timeout_ms !== undefined) {
+      bridgeArgs.timeoutMs = args.timeout_ms;
+      delete bridgeArgs.timeout_ms;
+    }
+    return ok(await bridge.runCommand(args.host, bridgeArgs));
   } catch (e) { throw toolError(e); }
 });
 
