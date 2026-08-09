@@ -5,8 +5,7 @@
   "main": "src/server.js",
   "bin": { "ssh-bridge-mcp": "src/server.js" },
   "scripts": {
-    "start": "node src/server.js",
-    "test": "node --test tests/*.test.js"
+    "start": "node src/server.js"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.12.1",

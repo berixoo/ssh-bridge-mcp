@@ -126,9 +126,3 @@ claude mcp add ssh-bridge -- node <path-to>/ssh-bridge-mcp/src/server.js
 - git 提交（多行消息）：`run_command(command: "git commit -F -", input: "feat: 新增 X\n\n- a\n- b")`
 - 查看日志：`run_command(command: "journalctl -u myapp --no-pager -n 50", sudo: true)`
 - 构建并部署：`run_command(command: "npm ci && npm run build && ./deploy.sh")`
-
-## 测试
-
-```bash
-npm test
-```
