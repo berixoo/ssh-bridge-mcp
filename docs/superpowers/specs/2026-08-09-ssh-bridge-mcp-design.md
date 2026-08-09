@@ -64,15 +64,16 @@ Claude Desktop / Claude Code / Codex
 
 - `list_hosts()` — 列出可用主机名及地址（不含任何凭据）
 
-- `run_command(host, command, cwd, timeout_ms, sudo, pty)` — 核心工具
+- `run_command(host, command, cwd, timeout_ms, sudo, pty, input)` — 核心工具
   - `sudo=true` 时自动用 `sudo -S` 喂密码
-  - `pty=true` 时在 PTY 下执行（支持 npm、python -i 等交互命令）
+  - `pty=true` 时在 PTY 下执行（获得 tty 环境，解决 npm 等 CLI 需要 tty 才能跑的问题）
+  - `input`（可选）一次性写入 stdin 后关闭 —— 用于需要一次性输入的命令；持续交互对话不在范围（见「非目标」）
   - 返回 `{ exitCode, stdout, stderr }`
 
 ### 文件（全部走 SFTP，不经 shell）
 
-- `read_file(host, path)` — 读远程文本文件
-- `write_file(host, path, content)` — 写远程文本文件（自动建目录）
+- `read_file(host, path)` — 读远程文本文件（面向文本/小文件；大文件用 `download`）
+- `write_file(host, path, content)` — 写远程文本文件，自动建目录（面向文本/小文件；大文件用 `upload`）
 - `upload(host, local_path, remote_path)` — 本机 → Linux
 - `download(host, remote_path, local_path)` — Linux → 本机
 
@@ -85,7 +86,9 @@ Claude Desktop / Claude Code / Codex
 ## 关键行为
 
 - **命令失败**返回真实 exit code，不抛异常；命令超时返回 timeout 状态。
-- **后台进程**：server 端维护 `task_id → { conn, channel, buffer }` 映射，日志按行缓冲，`background_logs` 返回增量。`stop_background` 发 SIGKILL。server 重启后后台进程清理，不跨重启恢复。
+- **后台进程**：server 端维护 `task_id → { conn, channel, buffer }` 映射，日志按行缓冲，`background_logs` 返回增量（从上次读的位置起）。`stop_background` 发 SIGKILL。server 重启后后台进程清理，不跨重启恢复。
+- **多客户端各自独立进程**：每个 MCP 客户端（Claude Desktop / Claude Code / Codex）通过 stdio 各自拉起一个 server 进程，后台进程池（task_id）**不跨客户端共享**。跨客户端共享后台进程不在范围。
+- **sudo 密码喂入**：通过 `sudo -S -p ''` 写入 channel stdin，不出现在远端命令行参数（避免出现在进程列表 / shell 历史）。
 - **连接池**：每个 host 维护一个可复用的连接（失败自动重建），多 host 并行；`background_logs` / `stop_background` 必须命中同一连接。
 
 ## 安全
@@ -109,6 +112,6 @@ Claude Desktop / Claude Code / Codex
 
 - 不专门做 git 工具 —— 用 `run_command` 跑 `git` 即可。
 - 不专门做部署工具 —— 同理由 `run_command` 覆盖。
-- 不做持久交互会话（start_session / send_input）—— 由 pty 标志 + 后台进程覆盖。
+- 不做持久交互会话（start_session / send_input）—— 由 pty 标志 + `input` 参数 + 后台进程覆盖一次性/持续输出场景；`python -i` 这类需要反复喂输入的持续对话不在范围。
 - 不做跨 server 重启的后台进程恢复。
 - 不做凭据加密存储。
