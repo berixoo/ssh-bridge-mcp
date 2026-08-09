@@ -1,0 +1,16 @@
+{
+  "name": "ssh-bridge-mcp",
+  "version": "1.0.0",
+  "description": "MCP server bridging SSH to LAN Linux hosts for coding agents",
+  "main": "src/server.js",
+  "bin": { "ssh-bridge-mcp": "src/server.js" },
+  "scripts": {
+    "start": "node src/server.js",
+    "test": "node --test tests/"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.12.1",
+    "ssh2": "^1.16.0",
+    "zod": "^3.24.4"
+  }
+}

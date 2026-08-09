@@ -1,0 +1,12 @@
+{
+  "default": "dev01",
+  "hosts": {
+    "dev01": {
+      "host": "192.168.1.10",
+      "port": 22,
+      "user": "roooi",
+      "password": "your-ssh-password",
+      "sudoPassword": "your-sudo-password"
+    }
+  }
+}
