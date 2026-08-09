@@ -23,11 +23,11 @@ test('runCommand returns exit code, stdout, stderr', async () => {
   assert.deepEqual(r, { exitCode: 1, stdout: 'out', stderr: 'err', timedOut: false, truncated: false });
 });
 
-test('runCommand wraps with setsid, captures pid, and applies sudo/cwd payload', async () => {
+test('runCommand wraps with bash -c, captures pid, and applies sudo/cwd payload', async () => {
   let seen;
   const b = makeBridge({ onExec: (cmd) => { seen = cmd; return { code: 0 }; } });
   await b.runCommand('dev', { command: "apt install 'pkg'", cwd: '/app', sudo: true });
-  assert.ok(seen.startsWith('setsid bash -c '), `expected setsid wrapper, got: ${seen}`);
+  assert.ok(seen.startsWith('bash -c '), `expected bash -c wrapper, got: ${seen}`);
   const pidM = seen.match(/\/tmp\/ssh-bridge-pid-([a-f0-9]+);/);
   assert.ok(pidM, 'expected pid capture');
   // Rebuild the expected command from the same pieces as the implementation
@@ -35,25 +35,33 @@ test('runCommand wraps with setsid, captures pid, and applies sudo/cwd payload',
   const inner = makeExecCommand({ command: "apt install 'pkg'", cwd: '/app', sudo: true });
   const shq = (s) => "'" + s.replace(/'/g, `'\\''`) + "'";
   const capture = `echo $$ > /tmp/ssh-bridge-pid-<PID>; trap 'rm -f /tmp/ssh-bridge-pid-<PID>' EXIT;\n`;
-  const expected = `setsid bash -c ${shq(capture + inner)}`.replace(/<PID>/g, pidM[1]);
+  const expected = `bash -c ${shq(capture + inner)}`.replace(/<PID>/g, pidM[1]);
   assert.equal(seen, expected);
 });
 
-test('runCommand does not wrap pty commands in setsid', async () => {
+test('runCommand does not wrap pty commands in bash -c', async () => {
   let seen;
   const b = makeBridge({ onExec: (cmd) => { seen = cmd; return { code: 0 }; } });
   await b.runCommand('dev', { command: 'vim', pty: true, cwd: '/app' });
-  assert.equal(seen, "cd '/app' && vim", `pty commands must not be setsid-wrapped, got: ${seen}`);
+  assert.equal(seen, "cd '/app' && vim", `pty commands must not be bash -c wrapped, got: ${seen}`);
 });
 
-test('runCommand passes env option to exec', async () => {
-  let seenOpts;
-  const b = makeBridge({ onExec: (_c, opts) => { seenOpts = opts; return { code: 0 }; } });
+test('runCommand injects env as exports into the command', async () => {
+  let seen;
+  const b = makeBridge({ onExec: (cmd) => { seen = cmd; return { code: 0 }; } });
   await b.runCommand('dev', { command: 'npm test', env: { NODE_ENV: 'test' } });
-  assert.deepEqual(seenOpts.env, { NODE_ENV: 'test' });
+  // The export is shq-escaped inside the outer setsid bash -c string, so the
+  // value 'test' appears as '\''test'\''. Assert the pieces are present and
+  // ordered rather than the exact escaped rendering.
+  const idxExport = seen.indexOf('export NODE_ENV=');
+  const idxVal = seen.indexOf('test');
+  const idxCmd = seen.indexOf('npm test');
+  assert.ok(idxExport !== -1, `expected export, got: ${seen}`);
+  assert.ok(idxVal > idxExport, `value must follow export, got: ${seen}`);
+  assert.ok(idxCmd > idxExport, `command must follow export, got: ${seen}`);
 });
 
-test('runCommand writes sudo password then input then ends stdin', async () => {
+test('runCommand writes sudo password then input, ending stdin after flush', async () => {
   let writes = [];
   const b = makeBridge({ onExec: (cmd) => ({ code: 0, onWrite: (w) => writes.push(w) }) });
   await b.runCommand('dev', { command: 'cat', sudo: true, input: 'hello' });
@@ -61,11 +69,15 @@ test('runCommand writes sudo password then input then ends stdin', async () => {
 });
 
 test('runCommand reports timeout', async () => {
-  const b = makeBridge({ onExec: () => ({ _neverClose: true }) });
+  const b = makeBridge({
+    onExec: (cmd) => (cmd.includes('kill_children') ? { code: 0 } : { _neverClose: true }),
+  });
   const start = Date.now();
   const r = await b.runCommand('dev', { command: 'sleep', timeoutMs: 50 });
   assert.equal(r.timedOut, true);
-  assert.ok(Date.now() - start < 3000);
+  // Timeout fires at 50ms; killProcessGroup adds one short exec. Keep the
+  // bound loose enough for mock event-loop timing but far under the old 3s.
+  assert.ok(Date.now() - start < 2000);
 });
 
 test('runCommand rejects when connection drops mid-command and pool rebuilds', async () => {
@@ -79,19 +91,22 @@ test('runCommand rejects when connection drops mid-command and pool rebuilds', a
   assert.equal(factory._clients.length, 2, 'pool must rebuild a fresh connection');
 });
 
-test('runCommand kills the process group on timeout', async () => {
+test('runCommand kills the process tree on timeout', async () => {
   const kills = [];
   const b = makeBridge({
     onExec: (cmd) => {
-      if (cmd.startsWith('kill -TERM -- -')) { kills.push(cmd); return { code: 0 }; }
+      if (cmd.includes('kill_children')) { kills.push(cmd); return { code: 0 }; }
       return { _neverClose: true };
     },
   });
   const r = await b.runCommand('dev', { command: 'sleep', timeoutMs: 50, cwd: '/app' });
   assert.equal(r.timedOut, true);
   assert.ok(
-    kills.some((k) => /kill -TERM -- -\$\(cat \/tmp\/ssh-bridge-pid-[a-f0-9]+\)/.test(k)),
-    `expected a process-group kill, got: ${kills.join(' | ')}`
+    kills.length > 0 &&
+      kills[0].includes('kill_children') &&
+      /cat \/tmp\/ssh-bridge-pid-[a-f0-9]+/.test(kills[0]) &&
+      kills[0].includes('kill -9'),
+    `expected a recursive tree kill, got: ${kills.join(' | ')}`
   );
 });
 

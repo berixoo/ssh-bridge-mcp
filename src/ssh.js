@@ -15,9 +15,21 @@ function shq(s) {
   return "'" + s.replace(/'/g, `'\\''`) + "'";
 }
 
-function makeExecCommand({ command, cwd, sudo }) {
+function makeExecCommand({ command, cwd, sudo, env }) {
   let full = command;
-  if (sudo) full = `sudo -S -p '' sh -c ${shq(command)}`;
+  if (env && Object.keys(env).length > 0) {
+    // ssh2's opts.env is delivered via SSH env channel requests, which
+    // OpenSSH ignores for exec sessions by default (PermitUserEnvironment
+    // off, no AcceptEnv). Emit exports directly into the command string so
+    // env always reaches the remote shell regardless of sshd config.
+    const exports = Object.entries(env)
+      .map(([k, v]) => `export ${k}=${shq(String(v))};`)
+      .join(' ');
+    full = `${exports} ${full}`;
+  }
+  // sudo and cwd wrap the *current* full string so env exports stay visible
+  // to the wrapped command (they run inside the sudo'd shell too).
+  if (sudo) full = `sudo -S -p '' sh -c ${shq(full)}`;
   if (cwd) full = `cd ${shq(cwd)} && ${full}`;
   return full;
 }
@@ -45,15 +57,20 @@ function mkdirp(sftp, dir) {
   });
 }
 
-// Best-effort kill of the whole process tree after a timeout. The exec command
-// is wrapped in `setsid` so the child becomes a session leader whose PID equals
-// its process-group id; killing the negative PID reaches every descendant.
+// Best-effort kill of the whole process tree after a timeout. The pid file
+// holds the PID of the `bash -c` wrapper that runs the command; recursively
+// SIGKILL every descendant, then the wrapper itself. (setsid is NOT used:
+// util-linux setsid forks, which both swallows the exit code and redirects
+// stdin to /dev/null when it is not a tty.)
 function killProcessGroup(client, pidFile) {
   return new Promise((resolve) => {
     let done = false;
-    const guard = setTimeout(() => { if (!done) { done = true; resolve(); } }, 2000);
+    const guard = setTimeout(() => { if (!done) { done = true; resolve(); } }, 3000);
     const finish = () => { if (done) return; done = true; clearTimeout(guard); resolve(); };
-    client.exec(`kill -TERM -- -$(cat ${pidFile}) 2>/dev/null || true; rm -f ${pidFile}`, (err, ch) => {
+    const script = `pid=$(cat ${pidFile} 2>/dev/null || true); ` +
+      `kill_children() { local p; for p in $(pgrep -P "$1" 2>/dev/null); do kill_children "$p"; kill -9 "$p" 2>/dev/null; done; }; ` +
+      `[ -n "$pid" ] && { kill_children "$pid"; kill -9 "$pid" 2>/dev/null; }; rm -f ${pidFile}; true`;
+    client.exec(`bash -c ${shq(script)}`, (err, ch) => {
       if (err) return finish();
       ch.on('exit', finish);
       ch.on('close', finish);
@@ -104,30 +121,27 @@ function createBridge(cfg, { clientFactory = () => new Client() } = {}) {
   }
 
   function execChannel(client, { command, cwd, timeoutMs, sudo, pty, env, input, sudoPassword }) {
-    // pty commands are already made session/process-group leaders by the SSH
-    // server (setsid + TIOCSCTTY on the pty), so wrapping them in setsid again
-    // would fail with EPERM on real OpenSSH. Only non-pty commands with a
-    // sudo/cwd wrapper get the setsid + pidFile treatment; pty timeouts keep
-    // the original ch.signal('SIGKILL') behavior (top shell only).
-    const wrap = !pty && (sudo || cwd);
+    // Every non-pty command runs through `bash -c` so a timeout can kill the
+    // whole process tree via killProcessGroup. setsid is avoided entirely:
+    // util-linux setsid forks, which swallows the exit code and redirects
+    // stdin to /dev/null when it isn't a tty. The wrapper records its own PID
+    // ($$) to a file; killProcessGroup then recursively SIGKILLs descendants.
+    // pty commands cannot be double-wrapped (the SSH server already makes them
+    // session/process-group leaders, and re-setsid would EPERM); their timeout
+    // keeps ch.signal('SIGKILL') (top shell only — accepted limitation).
+    const wrap = !pty;
     const pidFile = wrap ? `/tmp/ssh-bridge-pid-${crypto.randomBytes(6).toString('hex')}` : null;
     let full;
     if (wrap) {
-      // setsid detaches the command into its own session, making it the
-      // session leader whose PID equals the process-group id. The child pid is
-      // captured to a file so a timeout can signal the whole tree via
-      // kill(-pgid); the EXIT trap removes the pid file on normal completion.
-      const inner = makeExecCommand({ command, cwd, sudo });
+      const inner = makeExecCommand({ command, cwd, sudo, env });
       const capture = `echo $$ > ${pidFile}; trap 'rm -f ${pidFile}' EXIT;\n`;
-      full = `setsid bash -c ${shq(capture + inner)}`;
+      full = `bash -c ${shq(capture + inner)}`;
     } else {
-      // Non-wrapped path (plain or pty): apply cwd/sudo exactly as before the
-      // setsid change, and let pty timeouts use ch.signal('SIGKILL').
-      full = makeExecCommand({ command, cwd, sudo });
+      // pty: no extra wrapper (EPERM), apply cwd/sudo directly.
+      full = makeExecCommand({ command, cwd, sudo, env });
     }
     const opts = {};
     if (pty) opts.pty = { rows: 40, cols: 200, term: 'xterm-256color' };
-    if (env) opts.env = env;
     const timeout = timeoutMs || 30000;
     return new Promise((resolve, reject) => {
       const finish = (res) => {
@@ -194,11 +208,22 @@ function createBridge(cfg, { clientFactory = () => new Client() } = {}) {
           clearTimeout(timer);
           finish(null);
         });
-        ch.on('ready', () => {
-          if (sudo && sudoPassword) ch.stdin.write(sudoPassword + '\n');
-          if (input) ch.stdin.write(input);
+        // Write stdin immediately after the channel is created, NOT on the
+        // 'ready' event. ssh2 exec channels accept buffered writes before the
+        // open confirmation and flush them once it arrives; the flush callback
+        // then closes stdin (EOF). Writing + ending synchronously on 'ready'
+        // can drop the buffered data, stranding `cat`/`read`/`sudo -S` on
+        // empty stdin. Verified against real OpenSSH.
+        if (sudo && sudoPassword) {
+          ch.stdin.write(sudoPassword + '\n', () => {
+            if (input) ch.stdin.write(input, () => ch.stdin.end());
+            else ch.stdin.end();
+          });
+        } else if (input) {
+          ch.stdin.write(input, () => ch.stdin.end());
+        } else {
           ch.stdin.end();
-        });
+        }
         ch.on('exit', (code) => { exitCode = code; });
         ch.on('data', (d) => { stdout = append(stdout, d.toString(), () => { stdoutTruncated = true; }); });
         ch.stderr.on('data', (d) => { stderr = append(stderr, d.toString(), () => { stderrTruncated = true; }); });

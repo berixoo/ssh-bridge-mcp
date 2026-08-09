@@ -10,9 +10,14 @@ function makeChannel(res = {}) {
   ch.stdin = {
     writes: [],
     end: () => {},
-    write: (data) => {
+    write: (data, cb) => {
       ch.stdin.writes.push(data.toString());
       if (onWrite) onWrite(data.toString());
+      // Node writable streams invoke the write callback when the data is
+      // flushed; ssh2's stdin honors it too. nextTick (not setImmediate) so a
+      // chained `write -> cb -> write -> cb -> end` finishes before the
+      // channel's setImmediate close event, mirroring the real flush order.
+      if (cb) process.nextTick(cb);
       return true;
     },
   };
