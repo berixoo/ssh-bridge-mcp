@@ -1,0 +1,6 @@
+{
+  "default": "dev",
+  "hosts": {
+    "dev": { "host": "127.0.0.1", "port": 22, "user": "x", "password": "p" }
+  }
+}
