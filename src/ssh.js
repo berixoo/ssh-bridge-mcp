@@ -5,6 +5,7 @@ const path = require('path');
 const { resolveHost } = require('./config');
 
 const MAX_OUTPUT = 500 * 1024;
+const BG_GRACE_MS = 1500;
 const ANSI_RE = /\x1b\[[0-9;?]*[A-Za-z]/g;
 
 function stripAnsi(s) {
@@ -82,6 +83,29 @@ function killProcessGroup(client, pidFile) {
 function createBridge(cfg, { clientFactory = () => new Client() } = {}) {
   const conns = new Map();
   const tasks = new Map();
+
+  // A wedged connection (channels exhausted by a background job or a past leak)
+  // only recovers by dropping the TCP connection so the server frees every
+  // session. dispose() closes it and drops it from the pool; isChannelFailure
+  // matches ssh2's exact message; withRetry rebuilds once on a fresh conn.
+  function isChannelFailure(err) {
+    return /channel open|open failed/i.test((err && err.message) || '');
+  }
+  function dispose(name) {
+    const p = conns.get(name);
+    if (!p) return;
+    conns.delete(name);
+    p.then((c) => { try { c.end(); } catch (_) {} }).catch(() => {});
+  }
+  async function withRetry(name, fn) {
+    try {
+      return await fn();
+    } catch (err) {
+      if (!isChannelFailure(err)) throw err;
+      dispose(name);
+      return await fn();
+    }
+  }
 
   function getConn(name) {
     if (conns.has(name)) return conns.get(name);
@@ -177,6 +201,7 @@ function createBridge(cfg, { clientFactory = () => new Client() } = {}) {
         let exitCode = null;
         let timedOut = false;
         let done = false;
+        let bgGrace = null;
         // Bound accumulation now so runaway output (e.g. `yes`) cannot grow
         // stdout/stderr without limit and OOM the server before capping.
         const append = (cur, chunk, markTruncated) => {
@@ -206,6 +231,7 @@ function createBridge(cfg, { clientFactory = () => new Client() } = {}) {
           if (done) return;
           done = true;
           clearTimeout(timer);
+          if (bgGrace) clearTimeout(bgGrace);
           finish(null);
         });
         // Write stdin immediately after the channel is created, NOT on the
@@ -224,13 +250,29 @@ function createBridge(cfg, { clientFactory = () => new Client() } = {}) {
         } else {
           ch.stdin.end();
         }
-        ch.on('exit', (code) => { exitCode = code; });
+        ch.on('exit', (code) => {
+          exitCode = code;
+          // The foreground process is done. If a background job (`nohup ... &`)
+          // still holds the channel's stdio open, 'close' never arrives and the
+          // tool would block until it times out. Start a short countdown so we
+          // finish as a normal result (NOT a timeout, nothing is killed) when
+          // the channel is only being held by a detached child.
+          if (bgGrace == null) {
+            bgGrace = setTimeout(() => {
+              if (done) return;
+              done = true;
+              clearTimeout(timer);
+              finish({ exitCode, stdout, stderr, timedOut: false, truncated: stdoutTruncated || stderrTruncated });
+            }, BG_GRACE_MS);
+          }
+        });
         ch.on('data', (d) => { stdout = append(stdout, d.toString(), () => { stdoutTruncated = true; }); });
         ch.stderr.on('data', (d) => { stderr = append(stderr, d.toString(), () => { stderrTruncated = true; }); });
         ch.on('close', (code) => {
           if (done) return;
           done = true;
           clearTimeout(timer);
+          if (bgGrace) clearTimeout(bgGrace);
           if (exitCode == null) exitCode = code;
           // A close without an exit code and without a timeout means the
           // connection died mid-command; that is a failure, not a success
@@ -244,8 +286,10 @@ function createBridge(cfg, { clientFactory = () => new Client() } = {}) {
 
   function runCommand(name, args) {
     const entry = resolveHost(cfg, name);
-    return getConn(entry.name).then((client) =>
-      execChannel(client, { ...args, sudoPassword: entry.sudoPassword })
+    return withRetry(entry.name, () =>
+      getConn(entry.name).then((client) =>
+        execChannel(client, { ...args, sudoPassword: entry.sudoPassword })
+      )
     );
   }
 
@@ -258,13 +302,19 @@ function createBridge(cfg, { clientFactory = () => new Client() } = {}) {
     }));
   }
 
-  async function readFile(name, file) {
-    const s = await getSftp(name);
-    return new Promise((resolve, reject) =>
-      s.readFile(file, 'utf8', (e, d) =>
-        e ? reject(new Error(`read_file ${file}: ${e.message}`)) : resolve({ content: d })
-      )
-    );
+  function readFile(name, file) {
+    return withRetry(name, async () => {
+      const s = await getSftp(name);
+      try {
+        return await new Promise((resolve, reject) =>
+          s.readFile(file, 'utf8', (e, d) =>
+            e ? reject(new Error(`read_file ${file}: ${e.message}`)) : resolve({ content: d })
+          )
+        );
+      } finally {
+        try { s.end(); } catch (_) {}
+      }
+    });
   }
 
   async function writeRemoteFile(sftp, file, content) {
@@ -277,72 +327,105 @@ function createBridge(cfg, { clientFactory = () => new Client() } = {}) {
     );
   }
 
-  async function writeFile(name, file, content) {
-    const s = await getSftp(name);
-    await writeRemoteFile(s, file, content);
-    return { ok: true };
+  function writeFile(name, file, content) {
+    return withRetry(name, async () => {
+      const s = await getSftp(name);
+      try {
+        await writeRemoteFile(s, file, content);
+        return { ok: true };
+      } finally {
+        try { s.end(); } catch (_) {}
+      }
+    });
   }
 
-  async function upload(name, localPath, remotePath) {
-    const s = await getSftp(name);
-    await mkdirp(s, path.posix.dirname(remotePath));
-    await new Promise((resolve, reject) =>
-      s.fastPut(localPath, remotePath, (e) =>
-        e ? reject(new Error(`upload: ${e.message}`)) : resolve()
-      )
-    );
-    return { ok: true };
+  function upload(name, localPath, remotePath) {
+    return withRetry(name, async () => {
+      const s = await getSftp(name);
+      try {
+        await mkdirp(s, path.posix.dirname(remotePath));
+        await new Promise((resolve, reject) =>
+          s.fastPut(localPath, remotePath, (e) =>
+            e ? reject(new Error(`upload: ${e.message}`)) : resolve()
+          )
+        );
+        return { ok: true };
+      } finally {
+        try { s.end(); } catch (_) {}
+      }
+    });
   }
 
-  async function download(name, remotePath, localPath) {
-    const s = await getSftp(name);
-    fs.mkdirSync(path.dirname(localPath), { recursive: true });
-    await new Promise((resolve, reject) =>
-      s.fastGet(remotePath, localPath, (e) =>
-        e ? reject(new Error(`download: ${e.message}`)) : resolve()
-      )
-    );
-    return { ok: true };
+  function download(name, remotePath, localPath) {
+    return withRetry(name, async () => {
+      const s = await getSftp(name);
+      try {
+        fs.mkdirSync(path.dirname(localPath), { recursive: true });
+        await new Promise((resolve, reject) =>
+          s.fastGet(remotePath, localPath, (e) =>
+            e ? reject(new Error(`download: ${e.message}`)) : resolve()
+          )
+        );
+        return { ok: true };
+      } finally {
+        try { s.end(); } catch (_) {}
+      }
+    });
   }
 
-  async function startBackground(name, { command, cwd }) {
+  function startBackground(name, { command, cwd }) {
     const entry = resolveHost(cfg, name);
     const taskId = crypto.randomBytes(6).toString('hex');
     const scriptFile = `/tmp/ssh-bridge-${taskId}.sh`;
     const outFile = `/tmp/ssh-bridge-${taskId}.out`;
     const pidFile = `/tmp/ssh-bridge-${taskId}.pid`;
-    const s = await getSftp(entry.name);
-    await writeRemoteFile(s, scriptFile, command);
-    const run = `cd ${shq(cwd || '.')} && nohup bash ${shq(scriptFile)} > ${outFile} 2>&1 & echo $! > ${pidFile}`;
-    const r = await runCommand(entry.name, { command: run, timeoutMs: 15000 });
-    if (r.exitCode !== 0) {
-      await runCommand(entry.name, {
-        command: `rm -f ${scriptFile} ${outFile} ${pidFile}`,
-        timeoutMs: 5000,
-      }).catch(() => {});
-      throw new Error(`start_background failed: ${r.stderr}`);
-    }
-    const pidR = await runCommand(entry.name, { command: `cat ${pidFile}`, timeoutMs: 5000 });
-    const pid = pidR.stdout.trim();
-    if (!/^\d+$/.test(pid)) {
-      await runCommand(entry.name, {
-        command: `rm -f ${scriptFile} ${outFile} ${pidFile}`,
-        timeoutMs: 5000,
-      }).catch(() => {});
-      throw new Error('start_background failed: could not read process pid');
-    }
-    tasks.set(taskId, { hostName: entry.name, pid, scriptFile, outFile, pidFile, offset: 0 });
-    return { taskId, pid };
+    return withRetry(entry.name, async () => {
+      const s = await getSftp(entry.name);
+      try {
+        await writeRemoteFile(s, scriptFile, command);
+      } finally {
+        try { s.end(); } catch (_) {}
+      }
+      // </dev/null + redirected stdio detach the process from the channel so it
+      // cannot hold an ssh session open (which would exhaust MaxSessions).
+      const run = `cd ${shq(cwd || '.')} && nohup bash ${shq(scriptFile)} > ${outFile} 2>&1 < /dev/null & echo $! > ${pidFile}`;
+      const r = await runCommand(entry.name, { command: run, timeoutMs: 15000 });
+      if (r.exitCode !== 0) {
+        await runCommand(entry.name, {
+          command: `rm -f ${scriptFile} ${outFile} ${pidFile}`,
+          timeoutMs: 5000,
+        }).catch(() => {});
+        throw new Error(`start_background failed: ${r.stderr}`);
+      }
+      const pidR = await runCommand(entry.name, { command: `cat ${pidFile}`, timeoutMs: 5000 });
+      const pid = pidR.stdout.trim();
+      if (!/^\d+$/.test(pid)) {
+        await runCommand(entry.name, {
+          command: `rm -f ${scriptFile} ${outFile} ${pidFile}`,
+          timeoutMs: 5000,
+        }).catch(() => {});
+        throw new Error('start_background failed: could not read process pid');
+      }
+      tasks.set(taskId, { hostName: entry.name, pid, scriptFile, outFile, pidFile, offset: 0 });
+      return { taskId, pid };
+    });
   }
 
-  async function backgroundLogs(taskId) {
+  function backgroundLogs(taskId) {
     const t = tasks.get(taskId);
     if (!t) throw new Error(`unknown task_id ${taskId}`);
-    const s = await getSftp(t.hostName);
-    const { content, size } = await readFrom(s, t.outFile, t.offset);
-    t.offset = size;
-    const alive = await runCommand(t.hostName, { command: `kill -0 ${t.pid} 2>/dev/null || true`, timeoutMs: 5000 });
-    return { content, running: alive.exitCode === 0 };
+    return withRetry(t.hostName, async () => {
+      const s = await getSftp(t.hostName);
+      let r;
+      try {
+        r = await readFrom(s, t.outFile, t.offset);
+      } finally {
+        try { s.end(); } catch (_) {}
+      }
+      t.offset = r.size;
+      const alive = await runCommand(t.hostName, { command: `kill -0 ${t.pid} 2>/dev/null || true`, timeoutMs: 5000 });
+      return { content: r.content, running: alive.exitCode === 0 };
+    });
   }
 
   function readFrom(sftp, file, offset) {
