@@ -2,7 +2,9 @@ const { Client } = require('ssh2');
 const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
-const { resolveHost } = require('./config');
+const { resolveHost, knownHostsPaths, configPath } = require('./config');
+const { createKnownHostsStore, verifyHostKey } = require('./hostkeys');
+const { checkLocalPath } = require('./paths');
 
 const MAX_OUTPUT = 500 * 1024;
 const BG_GRACE_MS = 1500;
@@ -10,6 +12,12 @@ const ANSI_RE = /\x1b\[[0-9;?]*[A-Za-z]/g;
 
 function stripAnsi(s) {
   return s.replace(ANSI_RE, '');
+}
+
+// ssh2 reports SFTP status failures as an Error whose .code is the SFTP status
+// number; SSH_FX_NO_SUCH_FILE is 2.
+function isNoSuchFile(err) {
+  return !!err && (err.code === 2 || /no such file/i.test(err.message || ''));
 }
 
 function shq(s) {
@@ -58,6 +66,44 @@ function mkdirp(sftp, dir) {
   });
 }
 
+// Resolves { content, size, truncated, error }. Read failures are returned
+// rather than swallowed so callers can tell "no new data" from "broken".
+function readFrom(sftp, file, offset) {
+  return new Promise((resolve) => {
+    sftp.open(file, 'r', (e, h) => {
+      if (e) return resolve({ content: '', size: offset, truncated: false, error: e });
+      // The handle is closed on every path: a caller may loop this over one
+      // SFTP session (background log polling does), and leaked handles would
+      // accumulate on both ends.
+      const done = (result) => sftp.close(h, () => resolve(result));
+      sftp.fstat(h, (e2, st) => {
+        if (e2) return done({ content: '', size: offset, truncated: false, error: e2 });
+        // If the file shrank (rotated/truncated) below our offset, restart
+        // from the beginning instead of permanently skipping the new data.
+        const start = st.size < offset ? 0 : offset;
+        const available = st.size - start;
+        if (available <= 0) return done({ content: '', size: st.size, truncated: false, error: null });
+        // Cap the per-call read. Buffer.alloc(available) lets a runaway
+        // producer -- or an fstat that simply lies -- allocate unbounded memory
+        // in the server process.
+        const n = Math.min(available, MAX_OUTPUT);
+        const buf = Buffer.alloc(n);
+        sftp.read(h, buf, 0, n, start, (e3, bytes) => {
+          if (e3) return done({ content: '', size: offset, truncated: false, error: e3 });
+          // A non-numeric byte count would poison the caller's offset with NaN.
+          const got = Number.isFinite(bytes) ? Math.min(bytes, n) : 0;
+          done({
+            content: buf.subarray(0, got).toString('utf8'),
+            size: start + got,
+            truncated: available > got,
+            error: null,
+          });
+        });
+      });
+    });
+  });
+}
+
 // Best-effort kill of the whole process tree after a timeout. The pid file
 // holds the PID of the `bash -c` wrapper that runs the command; recursively
 // SIGKILL every descendant, then the wrapper itself. (setsid is NOT used:
@@ -80,9 +126,10 @@ function killProcessGroup(client, pidFile) {
   });
 }
 
-function createBridge(cfg, { clientFactory = () => new Client() } = {}) {
+function createBridge(cfg, { clientFactory = () => new Client(), configFile = configPath() } = {}) {
   const conns = new Map();
   const tasks = new Map();
+  const hostKeys = createKnownHostsStore(knownHostsPaths(cfg, configFile));
 
   // A wedged connection (channels exhausted by a background job or a past leak)
   // only recovers by dropping the TCP connection so the server frees every
@@ -113,8 +160,12 @@ function createBridge(cfg, { clientFactory = () => new Client() } = {}) {
       const entry = resolveHost(cfg, name);
       const client = clientFactory({});
       let ready = false;
+      // hostVerifier has no error channel, so a rejection reason is parked here
+      // and surfaced through the 'error' event that follows it. Without this the
+      // user only sees ssh2's generic "Host denied (verification failed)".
+      let hostKeyFailure = null;
       client.on('ready', () => { ready = true; resolve(client); });
-      client.on('error', (err) => reject(new Error(`SSH connection to ${entry.name} failed: ${err.message}`)));
+      client.on('error', (err) => reject(new Error(`SSH connection to ${entry.name} failed: ${hostKeyFailure || err.message}`)));
       // A connection that closes is dead: if it never became ready the pending
       // promise must not hang, and once ready the pool must drop it so the
       // next call rebuilds instead of reusing a stale client.
@@ -128,6 +179,21 @@ function createBridge(cfg, { clientFactory = () => new Client() } = {}) {
         username: entry.user,
         password: entry.password,
         readyTimeout: 15000,
+        // ssh2 auto-accepts whatever host key answers unless this is set, which
+        // would hand the password to an impersonator on the LAN.
+        hostVerifier: (blob) => {
+          const verdict = verifyHostKey({
+            store: hostKeys,
+            policy: entry.hostKeyPolicy,
+            host: entry.host,
+            port: entry.port,
+            blob,
+            label: entry.name,
+            pinnedFingerprint: entry.hostKeyFingerprint,
+          });
+          if (!verdict.ok) hostKeyFailure = verdict.message;
+          return verdict.ok;
+        },
       });
     }).catch((err) => {
       conns.delete(name);
@@ -306,11 +372,17 @@ function createBridge(cfg, { clientFactory = () => new Client() } = {}) {
     return withRetry(name, async () => {
       const s = await getSftp(name);
       try {
-        return await new Promise((resolve, reject) =>
-          s.readFile(file, 'utf8', (e, d) =>
-            e ? reject(new Error(`read_file ${file}: ${e.message}`)) : resolve({ content: d })
-          )
-        );
+        const r = await readFrom(s, file, 0);
+        if (r.error) throw new Error(`read_file ${file}: ${r.error.message}`);
+        // sftp.readFile pulls the whole file into memory with no bound, so a
+        // prompt-injected path (say /var/log/huge.log) could OOM the server.
+        // The tool is documented as small-text-files only.
+        if (r.truncated) {
+          throw new Error(
+            `read_file ${file}: not read completely -- the file exceeds the ${MAX_OUTPUT}-byte limit for read_file; use download for large files`
+          );
+        }
+        return { content: r.content };
       } finally {
         try { s.end(); } catch (_) {}
       }
@@ -339,13 +411,16 @@ function createBridge(cfg, { clientFactory = () => new Client() } = {}) {
     });
   }
 
-  function upload(name, localPath, remotePath) {
+  // async so a policy rejection arrives as a rejected promise like every other
+  // bridge method, rather than throwing synchronously out of the call.
+  async function upload(name, localPath, remotePath) {
+    const local = checkLocalPath({ localPath, cfg, configFile, tool: 'upload' });
     return withRetry(name, async () => {
       const s = await getSftp(name);
       try {
         await mkdirp(s, path.posix.dirname(remotePath));
         await new Promise((resolve, reject) =>
-          s.fastPut(localPath, remotePath, (e) =>
+          s.fastPut(local, remotePath, (e) =>
             e ? reject(new Error(`upload: ${e.message}`)) : resolve()
           )
         );
@@ -356,13 +431,14 @@ function createBridge(cfg, { clientFactory = () => new Client() } = {}) {
     });
   }
 
-  function download(name, remotePath, localPath) {
+  async function download(name, remotePath, localPath) {
+    const local = checkLocalPath({ localPath, cfg, configFile, tool: 'download' });
     return withRetry(name, async () => {
       const s = await getSftp(name);
       try {
-        fs.mkdirSync(path.dirname(localPath), { recursive: true });
+        fs.mkdirSync(path.dirname(local), { recursive: true });
         await new Promise((resolve, reject) =>
-          s.fastGet(remotePath, localPath, (e) =>
+          s.fastGet(remotePath, local, (e) =>
             e ? reject(new Error(`download: ${e.message}`)) : resolve()
           )
         );
@@ -422,29 +498,18 @@ function createBridge(cfg, { clientFactory = () => new Client() } = {}) {
       } finally {
         try { s.end(); } catch (_) {}
       }
-      t.offset = r.size;
+      // A log file that does not exist yet still means "no output", as before;
+      // any other read failure must not be reported as an idle task.
+      if (r.error && !isNoSuchFile(r.error)) {
+        throw new Error(`background_logs ${taskId}: ${r.error.message}`);
+      }
+      // Advance only past bytes actually returned. When the per-call read is
+      // capped, the next poll picks up where this one stopped instead of
+      // dropping the difference.
+      if (!r.error) t.offset = r.size;
       const alive = await runCommand(t.hostName, { command: `kill -0 ${t.pid} 2>/dev/null || true`, timeoutMs: 5000 });
-      return { content: r.content, running: alive.exitCode === 0 };
-    });
-  }
-
-  function readFrom(sftp, file, offset) {
-    return new Promise((resolve) => {
-      sftp.open(file, 'r', (e, h) => {
-        if (e) return resolve({ content: '', size: offset });
-        sftp.fstat(h, (e2, st) => {
-          if (e2) return resolve({ content: '', size: offset });
-          // If the file shrank (rotated/truncated) below our offset, restart
-          // from the beginning instead of permanently skipping the new data.
-          const start = st.size < offset ? 0 : offset;
-          const n = st.size - start;
-          if (n <= 0) return resolve({ content: '', size: st.size });
-          const buf = Buffer.alloc(n);
-          sftp.read(h, buf, 0, n, start, (e3, bytes) => {
-            resolve({ content: buf.subarray(0, bytes).toString('utf8'), size: st.size });
-          });
-        });
-      });
+      // truncated means the producer outran us: poll again for the remainder.
+      return { content: r.content, running: alive.exitCode === 0, truncated: r.truncated === true };
     });
   }
 
@@ -473,4 +538,13 @@ function createBridge(cfg, { clientFactory = () => new Client() } = {}) {
   };
 }
 
-module.exports = { createBridge, makeExecCommand, stripAnsi, mkdirp, killProcessGroup, MAX_OUTPUT };
+module.exports = {
+  createBridge,
+  makeExecCommand,
+  stripAnsi,
+  mkdirp,
+  killProcessGroup,
+  isNoSuchFile,
+  readFrom,
+  MAX_OUTPUT,
+};

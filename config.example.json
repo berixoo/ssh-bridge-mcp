@@ -1,5 +1,7 @@
 {
   "default": "dev01",
+  "hostKeyPolicy": "insecure",
+  "localRoots": ["<allowed-local-dir>"],
   "hosts": {
     "dev01": {
       "host": "<remote-host-ip>",

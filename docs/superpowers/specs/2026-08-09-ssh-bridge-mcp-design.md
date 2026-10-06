@@ -91,7 +91,7 @@ Claude Desktop / Claude Code / Codex
 ### 后台进程
 
 - `start_background(host, command, cwd)` — 启动长驻进程（dev server、训练任务），返回 `task_id`
-- `background_logs(task_id, tail)` — 读后台进程日志（增量，从上次读的位置起）
+- `background_logs(task_id)` — 读后台进程日志（增量，从上次读的位置起）
 - `stop_background(task_id)` — 终止进程
 
 ## 关键行为
@@ -108,6 +108,16 @@ Claude Desktop / Claude Code / Codex
 - SSH 连接错误信息剥离凭据。
 - 配置文件放项目根目录 `config.json`（可用环境变量 `SSH_BRIDGE_CONFIG` 指定路径），server 进程能读，LLM 读不到。
 - 自用局域网场景，不做过度加密。
+
+### 加固（2026-10-06 复审后补）
+
+原设计有三处缺口，前两处按「自用局域网 + 本地虚拟机」的定位做成**可选加固**（默认关闭，风险写在 README「安全边界」），第三处是纯缺陷，直接修：
+
+- **主机密钥不校验**：`ssh2` 未传 `hostVerifier` 时接受任意主机密钥（见 ssh2 README「Default: (auto-accept if hostVerifier is not set)」），局域网内冒充目标主机即可收走明文密码。现提供 `hostKeyPolicy: "tofu" | "strict"`，密钥记入 OpenSSH 格式的 `known_hosts`，不一致即拒绝；另有按主机的 `hostKeyFingerprint`。默认 `insecure`（保持原行为），因为 tofu 与「VM 频繁重建」直接冲突。
+- **本机路径无边界**：`upload` / `download` 的本机路径直接来自模型，被 prompt injection 后可外传任意本机文件（含 `config.json` 的明文密码），或用 `download` 覆盖本机任意路径。现提供可选的 `localRoots` 目录白名单（默认不限制）。**配置文件本身在任何配置下都不可传输**——这项零成本，不受开关影响。
+- **无界缓冲**：`readFrom` 的 `Buffer.alloc(size)` 与 `read_file` 的 `sftp.readFile` 都按远端文件大小一次性分配。现统一夹到 `MAX_OUTPUT`（500 KB）；`background_logs` 每次只取 500 KB、偏移按实际读到的字节推进，多出来的部分靠下一次轮询续读（返回 `truncated` 提示），既不截断丢数据也不 OOM。
+
+`sudoPassword` 缺省等于 `password` 属于有意的取舍，未改动：本 server 的定位就是把不受限的 shell 交给 LLM，加命令白名单会让工具失去意义。代价是 sudo 与 SSH 共用一个密码时，一台主机失守等于该机 root 失守——需要隔离就显式配不同的 `sudoPassword`。
 
 ## 错误处理
 

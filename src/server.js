@@ -1,12 +1,34 @@
 #!/usr/bin/env node
+const fs = require('fs');
+const path = require('path');
 const { McpServer } = require('@modelcontextprotocol/sdk/server/mcp.js');
 const { StdioServerTransport } = require('@modelcontextprotocol/sdk/server/stdio.js');
 const { z } = require('zod');
 const { createBridge } = require('./ssh');
-const { loadConfig } = require('./config');
+const { loadConfig, configPath } = require('./config');
 
 const cfg = loadConfig();
 const bridge = createBridge(cfg);
+
+// Neither check is on by default (see README "安全边界"). Say so once at
+// startup so a permissive bridge is never silently permissive.
+const cfgFile = configPath();
+const roots = cfg.localRoots || [];
+for (const root of roots) {
+  const absolute = path.resolve(path.dirname(cfgFile), root);
+  if (!fs.existsSync(absolute)) {
+    console.error(`[ssh-bridge-mcp] localRoots "${root}" does not exist (${absolute}); paths under it will be refused`);
+  }
+}
+const verifiesHostKeys =
+  (cfg.hostKeyPolicy && cfg.hostKeyPolicy !== 'insecure') ||
+  Object.values(cfg.hosts).some((h) => (h.hostKeyPolicy && h.hostKeyPolicy !== 'insecure') || h.hostKeyFingerprint);
+if (!verifiesHostKeys && roots.length === 0) {
+  console.error(
+    '[ssh-bridge-mcp] permissive defaults: host keys are not verified and upload/download accept any local ' +
+      'path. See the "安全边界" section of README.md for hostKeyPolicy / localRoots.'
+  );
+}
 
 const server = new McpServer({ name: 'ssh-bridge-mcp', version: '1.0.0' });
 
@@ -43,7 +65,7 @@ server.registerTool('run_command', {
 });
 
 server.registerTool('read_file', {
-  description: 'Read a text file on the remote host (small files only; use download for large).',
+  description: 'Read a text file on the remote host (small files only, hard limit 500 KB; use download for large).',
   inputSchema: { host: hostSchema, path: z.string().min(1) },
 }, async (args) => {
   try { return ok(await bridge.readFile(args.host, args.path)); } catch (e) { throw toolError(e); }
@@ -57,14 +79,14 @@ server.registerTool('write_file', {
 });
 
 server.registerTool('upload', {
-  description: 'Upload a local (Windows) file to a remote POSIX path via SFTP. Creates remote directories.',
+  description: 'Upload a local (Windows) file to a remote POSIX path via SFTP. Creates remote directories. If the server configures localRoots, local_path must lie inside one of them.',
   inputSchema: { host: hostSchema, local_path: z.string().min(1), remote_path: z.string().min(1) },
 }, async (args) => {
   try { return ok(await bridge.upload(args.host, args.local_path, args.remote_path)); } catch (e) { throw toolError(e); }
 });
 
 server.registerTool('download', {
-  description: 'Download a remote file to a local (Windows) path via SFTP.',
+  description: 'Download a remote file to a local (Windows) path via SFTP. If the server configures localRoots, local_path must lie inside one of them.',
   inputSchema: { host: hostSchema, remote_path: z.string().min(1), local_path: z.string().min(1) },
 }, async (args) => {
   try { return ok(await bridge.download(args.host, args.remote_path, args.local_path)); } catch (e) { throw toolError(e); }
@@ -82,7 +104,7 @@ server.registerTool('start_background', {
 });
 
 server.registerTool('background_logs', {
-  description: 'Read new log output since the last call for a background task. Returns { content, running }.',
+  description: 'Read new log output since the last call for a background task. Returns { content, running, truncated }. truncated:true means more output is already waiting -- call again to get it.',
   inputSchema: { task_id: z.string().min(1) },
 }, async (args) => {
   try { return ok(await bridge.backgroundLogs(args.task_id)); } catch (e) { throw toolError(e); }
