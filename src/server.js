@@ -86,7 +86,7 @@ server.registerTool('upload', {
 });
 
 server.registerTool('download', {
-  description: 'Download a remote file to a local (Windows) path via SFTP. If the server configures localRoots, local_path must lie inside one of them.',
+  description: 'Download a remote file to a local (Windows) path via SFTP. Refuses files larger than maxDownloadBytes (config, default 2 GiB); if localRoots is configured, local_path must lie inside one of them.',
   inputSchema: { host: hostSchema, remote_path: z.string().min(1), local_path: z.string().min(1) },
 }, async (args) => {
   try { return ok(await bridge.download(args.host, args.remote_path, args.local_path)); } catch (e) { throw toolError(e); }

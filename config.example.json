@@ -2,6 +2,7 @@
   "default": "dev01",
   "hostKeyPolicy": "insecure",
   "localRoots": ["<allowed-local-dir>"],
+  "maxDownloadBytes": 2147483648,
   "hosts": {
     "dev01": {
       "host": "<remote-host-ip>",

@@ -111,11 +111,13 @@ Claude Desktop / Claude Code / Codex
 
 ### 加固（2026-10-06 复审后补）
 
-原设计有三处缺口，前两处按「自用局域网 + 本地虚拟机」的定位做成**可选加固**（默认关闭，风险写在 README「安全边界」），第三处是纯缺陷，直接修：
+原设计有五处缺口。前两处按「自用局域网 + 本地虚拟机」的定位做成**可选加固**（默认关闭，风险写在 README「安全边界」），后三处是纯缺陷，直接修：
 
 - **主机密钥不校验**：`ssh2` 未传 `hostVerifier` 时接受任意主机密钥（见 ssh2 README「Default: (auto-accept if hostVerifier is not set)」），局域网内冒充目标主机即可收走明文密码。现提供 `hostKeyPolicy: "tofu" | "strict"`，密钥记入 OpenSSH 格式的 `known_hosts`，不一致即拒绝；另有按主机的 `hostKeyFingerprint`。默认 `insecure`（保持原行为），因为 tofu 与「VM 频繁重建」直接冲突。
 - **本机路径无边界**：`upload` / `download` 的本机路径直接来自模型，被 prompt injection 后可外传任意本机文件（含 `config.json` 的明文密码），或用 `download` 覆盖本机任意路径。现提供可选的 `localRoots` 目录白名单（默认不限制）。**配置文件本身在任何配置下都不可传输**——这项零成本，不受开关影响。
 - **无界缓冲**：`readFrom` 的 `Buffer.alloc(size)` 与 `read_file` 的 `sftp.readFile` 都按远端文件大小一次性分配。现统一夹到 `MAX_OUTPUT`（500 KB）；`background_logs` 每次只取 500 KB、偏移按实际读到的字节推进，多出来的部分靠下一次轮询续读（返回 `truncated` 提示），既不截断丢数据也不 OOM。
+- **下载无大小上限**：`download` 可以把远端任意大的文件写到本机。现先 `stat` 再传，超过 `maxDownloadBytes`（默认 2 GiB，可配，`0` = 不限制）在传第一个字节前拒绝；并把已核验的大小作为 `fileSize` 传给 `fastGet`，其读循环以该值为界，所以远端谎报大小也有硬上界。传完核对字节数，写少了报错而非静默成功。
+- **SHA-1 算法**：ssh2 的默认提议列表本身已是现代的（CBC/3DES/arcfour/ssh-dss/sha1-KEX 都在其 "supported" 列表里，不会主动提议），剩下的 `ssh-rsa` 与 `hmac-sha1*` 现通过 `remove` 操作从默认列表减掉——做减法而非钉死列表，ssh2 的能力探测仍然生效。`algorithms` 可按主机覆盖，`allowLegacyAlgorithms: true` 恢复完整默认。
 
 `sudoPassword` 缺省等于 `password` 属于有意的取舍，未改动：本 server 的定位就是把不受限的 shell 交给 LLM，加命令白名单会让工具失去意义。代价是 sudo 与 SSH 共用一个密码时，一台主机失守等于该机 root 失守——需要隔离就显式配不同的 `sudoPassword`。
 
@@ -126,7 +128,7 @@ Claude Desktop / Claude Code / Codex
 
 ## 测试
 
-- `scripts/self-check.mjs` 用 assert 验证核心逻辑。
+- `npm test` → `scripts/self-check.js`，用 assert 验证核心逻辑。**纯离线**：known_hosts 解析、主机密钥校验、路径边界、读写上限、算法选择、上传下载策略，全部走 fake，不需要任何 SSH 服务器。
 - 每个非平凡逻辑留一个可运行的检查。
 
 ## 使用说明（面向 agent）

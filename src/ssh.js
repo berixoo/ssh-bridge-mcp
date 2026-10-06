@@ -10,6 +10,42 @@ const MAX_OUTPUT = 500 * 1024;
 const BG_GRACE_MS = 1500;
 const ANSI_RE = /\x1b\[[0-9;?]*[A-Za-z]/g;
 
+// Bound a single download. 2 GiB is far above anything this bridge is meant to
+// shuttle between a workstation and a local VM, while still stopping a remote
+// from filling the local disk. maxDownloadBytes: 0 disables the check.
+const DEFAULT_MAX_DOWNLOAD = 2 * 1024 * 1024 * 1024;
+
+// ssh2's own defaults are already modern: CBC, 3DES, arcfour, ssh-dss and the
+// sha1 KEX suites live only in its "supported" lists and are never offered
+// unless asked for. What remains in the default offer is SHA-1 -- the ssh-rsa
+// signature scheme and the hmac-sha1 MACs. Subtract those rather than pinning a
+// list, so ssh2's capability filtering still decides what this build can do and
+// an unsupported algorithm can never be requested.
+const SHA1_REMOVALS = {
+  serverHostKey: { remove: ['ssh-rsa'] },
+  hmac: { remove: ['hmac-sha1', 'hmac-sha1-etm@openssh.com'] },
+};
+
+function connectAlgorithms(cfg) {
+  if (cfg.allowLegacyAlgorithms === true) return cfg.algorithms;
+  const out = { ...SHA1_REMOVALS };
+  for (const [group, value] of Object.entries(cfg.algorithms || {})) {
+    const mine = out[group];
+    // An exact array replaces the default outright; an operation object
+    // (append/prepend/remove) is merged so the SHA-1 removal survives.
+    out[group] =
+      mine && value && !Array.isArray(value) && typeof value === 'object'
+        ? { ...mine, ...value }
+        : value;
+  }
+  return out;
+}
+
+function downloadLimit(cfg) {
+  if (cfg.maxDownloadBytes === undefined) return DEFAULT_MAX_DOWNLOAD;
+  return cfg.maxDownloadBytes;
+}
+
 function stripAnsi(s) {
   return s.replace(ANSI_RE, '');
 }
@@ -104,6 +140,25 @@ function readFrom(sftp, file, offset) {
   });
 }
 
+function statRemote(sftp, file) {
+  return new Promise((resolve, reject) =>
+    sftp.stat(file, (e, st) => (e ? reject(new Error(`stat ${file}: ${e.message}`)) : resolve(st)))
+  );
+}
+
+// fastGet's read loop is bounded by the file size it works from, so handing it
+// the size we already checked turns the limit into a hard ceiling: a remote
+// that lied in stat() still cannot push more than that many bytes. (ssh2
+// honours options.fileSize but leaves it out of its documented option list.)
+function fastGetInto(sftp, remotePath, localPath, size) {
+  return new Promise((resolve, reject) => {
+    const opts = size > 0 ? { fileSize: size } : {};
+    sftp.fastGet(remotePath, localPath, opts, (e) =>
+      e ? reject(new Error(`download: ${e.message}`)) : resolve()
+    );
+  });
+}
+
 // Best-effort kill of the whole process tree after a timeout. The pid file
 // holds the PID of the `bash -c` wrapper that runs the command; recursively
 // SIGKILL every descendant, then the wrapper itself. (setsid is NOT used:
@@ -179,6 +234,7 @@ function createBridge(cfg, { clientFactory = () => new Client(), configFile = co
         username: entry.user,
         password: entry.password,
         readyTimeout: 15000,
+        algorithms: connectAlgorithms(cfg),
         // ssh2 auto-accepts whatever host key answers unless this is set, which
         // would hand the password to an impersonator on the LAN.
         hostVerifier: (blob) => {
@@ -433,15 +489,29 @@ function createBridge(cfg, { clientFactory = () => new Client(), configFile = co
 
   async function download(name, remotePath, localPath) {
     const local = checkLocalPath({ localPath, cfg, configFile, tool: 'download' });
+    const limit = downloadLimit(cfg);
     return withRetry(name, async () => {
       const s = await getSftp(name);
       try {
+        const st = await statRemote(s, remotePath);
+        // Checked before a byte moves: a hostile or broken remote could
+        // otherwise stream until the local disk is full.
+        if (limit > 0 && st.size > limit) {
+          throw new Error(
+            `download ${remotePath}: ${st.size} bytes exceeds maxDownloadBytes (${limit}); ` +
+              'raise "maxDownloadBytes" in the server config (0 = unlimited) if the file is legitimate'
+          );
+        }
         fs.mkdirSync(path.dirname(local), { recursive: true });
-        await new Promise((resolve, reject) =>
-          s.fastGet(remotePath, local, (e) =>
-            e ? reject(new Error(`download: ${e.message}`)) : resolve()
-          )
-        );
+        await fastGetInto(s, remotePath, local, st.size);
+        // A download that quietly wrote fewer bytes than the file holds is the
+        // same class of silent loss this bridge has been fixed for elsewhere.
+        if (st.size > 0) {
+          const written = fs.statSync(local).size;
+          if (written !== st.size) {
+            throw new Error(`download ${remotePath}: wrote ${written} of ${st.size} bytes`);
+          }
+        }
         return { ok: true };
       } finally {
         try { s.end(); } catch (_) {}
@@ -546,5 +616,10 @@ module.exports = {
   killProcessGroup,
   isNoSuchFile,
   readFrom,
+  statRemote,
+  connectAlgorithms,
+  downloadLimit,
+  SHA1_REMOVALS,
+  DEFAULT_MAX_DOWNLOAD,
   MAX_OUTPUT,
 };

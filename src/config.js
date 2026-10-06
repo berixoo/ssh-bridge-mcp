@@ -25,6 +25,12 @@ const ConfigSchema = z
     // local filesystem boundary for upload/download (opt-in; unset means no
     // restriction, which is what a local-VM dev setup wants)
     localRoots: z.array(z.string()).optional(),
+    // refuse a download whose remote size exceeds this; 0 means unlimited
+    maxDownloadBytes: z.number().int().min(0).optional(),
+    // ssh2 algorithm lists; merged over the built-in SHA-1 removals
+    algorithms: z.record(z.string(), z.any()).optional(),
+    // restore ssh2's full default offer (put back ssh-rsa / hmac-sha1)
+    allowLegacyAlgorithms: z.boolean().optional(),
   })
   .refine((c) => Object.keys(c.hosts).length > 0, { message: 'at least one host required' });
 

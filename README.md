@@ -22,6 +22,7 @@ Claude Desktop / Claude Code / Codex
      "default": "dev01",
      "hostKeyPolicy": "insecure",
      "localRoots": ["<allowed-local-dir>"],
+     "maxDownloadBytes": 2147483648,
      "hosts": {
        "dev01": {
          "host": "<remote-host-ip>",
@@ -38,7 +39,7 @@ Claude Desktop / Claude Code / Codex
 
 配置文件默认在项目根目录 `config.json`，可用环境变量 `SSH_BRIDGE_CONFIG` 覆盖。配置文件内容在工具输出中永不出现。
 
-`hostKeyPolicy` 与 `localRoots` 都是**可选**的加固项，默认关闭（自用局域网 + 本地虚拟机场景）。不想要就直接删掉那两行，见「[安全边界](#安全边界)」。
+`hostKeyPolicy` 与 `localRoots` 都是**可选**的加固项，默认关闭（自用局域网 + 本地虚拟机场景）。不想要就直接删掉那两行，见「[安全边界](#安全边界)」。`maxDownloadBytes` 默认 2 GiB，只在你要传更大的文件时才需要动。
 
 ## 接入
 
@@ -72,7 +73,7 @@ claude mcp add ssh-bridge -- node <path-to>/ssh-bridge-mcp/src/server.js
 | `read_file` | 读远程文本文件（上限 500 KB，超了报错；大文件用 `download`） |
 | `write_file` | 写远程文本文件，自动建目录（面向文本/小文件；大文件用 `upload`） |
 | `upload` | 本机 -> Linux，SFTP 传文件（大文件/目录）。配了 `localRoots` 时本机路径须落在其中 |
-| `download` | Linux -> 本机，SFTP 传文件（大文件/目录）。配了 `localRoots` 时本机路径须落在其中 |
+| `download` | Linux -> 本机，SFTP 传文件（大文件/目录）。超过 `maxDownloadBytes`（默认 2 GiB）拒绝；配了 `localRoots` 时本机路径须落在其中 |
 | `start_background` | 启动长驻进程（dev server、训练任务），返回 `task_id` |
 | `background_logs` | 读后台进程日志（增量，从上次读的位置起；`truncated: true` 表示还有，继续调） |
 | `stop_background` | 终止后台进程 |
@@ -116,6 +117,29 @@ claude mcp add ssh-bridge -- node <path-to>/ssh-bridge-mcp/src/server.js
 - 配了不存在的目录会启动报错并列出实际解析到的绝对路径。
 
 另外有一条**始终生效、不可关闭**：配置文件本身永远不可传输。它零成本（没人需要把自己的凭据库传到虚拟机上），且正好是上面那条泄露路径的入口。
+
+### 传输大小上限
+
+`download` 在传第一个字节之前先 `stat` 远端文件，超过 `maxDownloadBytes` 就拒绝，默认 **2 GiB**（`0` = 不限制）。这是防「远端把本机磁盘写满」，不是防大文件——50 MB ~ 1 GB 这类正常传输不受影响，实测 50 MB 文件约 47 MB/s 且逐字节一致。
+
+拒了就把 `maxDownloadBytes` 调大；限额是配置项而不是硬编码，正是为了不挡住正当的大文件。传完还会核对本地文件字节数与远端声明的一致，写少了会报错而不是当成功返回。
+
+### 算法套件
+
+ssh2 自己的默认提议列表**本来就是现代的**——CBC、3DES、arcfour、ssh-dss、sha1 系列密钥交换只在它的 "supported" 列表里，不主动提议。所以默认列表里唯一过时的东西是 SHA-1，本 server 把它减掉：
+
+- `serverHostKey` 去掉 `ssh-rsa`（SHA-1 签名方案）
+- `hmac` 去掉 `hmac-sha1` 与 `hmac-sha1-etm@openssh.com`
+
+用的是 ssh2 的 `remove` 操作，从默认列表里做减法，所以 ssh2 的能力探测仍然生效，不会出现「请求了本机 crypto 不支持的算法」而直接抛错。实测发出去的 KEXINIT 为：
+
+```
+serverHostKey: ssh-ed25519, ecdsa-sha2-nistp256, ecdsa-sha2-nistp384, ecdsa-sha2-nistp521, rsa-sha2-512, rsa-sha2-256
+mac          : hmac-sha2-256-etm@openssh.com, hmac-sha2-512-etm@openssh.com, hmac-sha2-256, hmac-sha2-512
+```
+
+- 要按主机自定义就写 `algorithms`（ssh2 的格式：精确数组，或 `append` / `prepend` / `remove` 对象；对象形式会与上面的减法合并，数组形式则整体替换该组）。
+- 遇到只支持 ssh-rsa 的老设备，写 `"allowLegacyAlgorithms": true` 恢复 ssh2 的完整默认提议。
 
 `sudoPassword` 缺省等于 `password`（见 `src/config.js`）：sudo 与 SSH 共用同一个密码时，一台主机失守就等于那台机器 root 失守。密码不同的话显式写 `sudoPassword`。
 
