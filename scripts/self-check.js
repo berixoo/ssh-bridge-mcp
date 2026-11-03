@@ -18,13 +18,22 @@ const paths = require(path.join(ROOT, 'src', 'paths.js'));
 const {
   createBridge,
   readFrom,
+  readBinary,
   statRemote,
   connectAlgorithms,
   downloadLimit,
+  makeExecCommand,
   SHA1_REMOVALS,
   DEFAULT_MAX_DOWNLOAD,
   MAX_OUTPUT,
 } = require(path.join(ROOT, 'src', 'ssh.js'));
+const {
+  buildCaptureScript,
+  buildOptimizeScript,
+  parseCaptureResult,
+  looksLikeImage,
+  NO_SESSION,
+} = require(path.join(ROOT, 'src', 'screenshot.js'));
 const { resolveHost } = require(path.join(ROOT, 'src', 'config.js'));
 
 let pass = 0;
@@ -559,6 +568,167 @@ async function main() {
     assert.rejects(() => createBridge({ ...BASE_CFG, localRoots: undefined }, noNet).upload('dev01', path.join(outsideDir, 'f.txt'), '/tmp/x'), /must not be reached/));
   await checkAsync('download refuses an out-of-root local path', () =>
     assert.rejects(() => createBridge(BASE_CFG, noNet).download('dev01', '/etc/shadow', path.join(outsideDir, 'shadow')), /outside the configured localRoots/));
+
+  section('screenshot helpers');
+  check('capture script discovers the session through logind, not $DISPLAY', () => {
+    const s = buildCaptureScript();
+    assert.ok(s.includes('loginctl list-sessions'));
+    assert.ok(s.includes('show-session'), 'must read Type/Display from logind');
+    assert.ok(/wayland\|x11/.test(s), 'must skip tty sessions when choosing the seat session');
+  });
+  check('every capture attempt is bounded by timeout', () => {
+    const s = buildCaptureScript();
+    assert.ok(s.includes('timeout 20'), 'gnome-screenshot blocks forever on its X11 fallback');
+    assert.strictEqual((s.match(/timeout 20 "\$@"/g) || []).length, 1);
+  });
+  check('GNOME gets gnome-screenshot over Xwayland with the mutter auth file', () => {
+    const s = buildCaptureScript();
+    assert.ok(s.includes('.mutter-Xwaylandauth.'));
+    assert.ok(/gnome-screenshot-xwayland/.test(s));
+    assert.ok(/DISPLAY=:0 XAUTHORITY=/.test(s));
+  });
+  check('wayland chain also covers wlroots via grim', () => {
+    const s = buildCaptureScript();
+    assert.ok(s.includes('grim'));
+    assert.ok(s.includes('spectacle'));
+  });
+  check('no screenshot means exit 3, not a silent empty file', () => {
+    assert.strictEqual(NO_SESSION, 3);
+    assert.ok(buildCaptureScript().includes('exit 3'), 'script must exit 3 for no session');
+  });
+  check('parses a successful capture', () => {
+    const r = parseCaptureResult('noise\nRESULT|ok|gnome-screenshot-xwayland|wayland|\n');
+    assert.strictEqual(r.ok, true);
+    assert.strictEqual(r.tool, 'gnome-screenshot-xwayland');
+    assert.strictEqual(r.sessionType, 'wayland');
+  });
+  check('parses a no-session result into an actionable message', () => {
+    const r = parseCaptureResult('RESULT|nosession|||\n');
+    assert.strictEqual(r.ok, false);
+    assert.strictEqual(r.noSession, true);
+    assert.ok(/no graphical session/i.test(r.error));
+  });
+  check('a failed capture lists what was tried', () => {
+    const r = parseCaptureResult('RESULT|fail||wayland||grim; imagemagick; ');
+    assert.strictEqual(r.ok, false);
+    assert.ok(/tried: grim; imagemagick/.test(r.error), r.error);
+    assert.ok(/gnome-screenshot/.test(r.error), 'should suggest the fix');
+  });
+  check('a missing result line is an error, not success', () => {
+    assert.strictEqual(parseCaptureResult('').ok, false);
+    assert.strictEqual(parseCaptureResult('garbage').ok, false);
+  });
+  check('looksLikeImage accepts real image magic and rejects junk', () => {
+    const png = Buffer.concat([Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]), Buffer.alloc(100)]);
+    const jpeg = Buffer.concat([Buffer.from([0xff, 0xd8, 0xff, 0xe0]), Buffer.alloc(100)]);
+    assert.ok(looksLikeImage(png));
+    assert.ok(looksLikeImage(jpeg));
+    assert.ok(!looksLikeImage(Buffer.alloc(200)), 'an all-zero capture is not an image');
+    assert.ok(!looksLikeImage(Buffer.from('<html>error</html>'.padEnd(200, ' '))));
+    assert.ok(!looksLikeImage(Buffer.alloc(10)), 'too small to be an image');
+  });
+  check('optimize script leaves the capture alone when ImageMagick is missing', () => {
+    const s = buildOptimizeScript();
+    assert.ok(s.includes('command -v convert'));
+    assert.ok(s.includes('echo "ORIGINAL"'), 'must fall back, not fail');
+  });
+
+  section('command building');
+  check('pipefail is opt-in and wraps the command before env/sudo', () => {
+    assert.ok(!makeExecCommand({ command: 'cat /etc/shadow | head -1' }).includes('pipefail'));
+    const strict = makeExecCommand({ command: 'cat /etc/shadow | head -1', pipefail: true });
+    assert.ok(strict.startsWith('set -o pipefail; '), strict);
+  });
+  check('env exports survive sudo wrapping', () => {
+    const c = makeExecCommand({ command: 'echo $FOO', sudo: true, env: { FOO: 'bar' } });
+    // The export is inside the quoted sh -c payload, so its quotes are escaped.
+    assert.ok(c.includes('export FOO='), c);
+    assert.ok(c.includes('bar'), c);
+    assert.ok(c.startsWith("sudo -S -p '' sh -c"), c);
+  });
+  check('cwd is applied outside the sudo wrapper', () => {
+    const c = makeExecCommand({ command: 'id', sudo: true, cwd: '/etc' });
+    assert.ok(c.startsWith("cd '/etc' && sudo"), c);
+  });
+
+  section('readBinary (image transfer)');
+  await checkAsync('returns raw bytes without utf8 mangling', async () => {
+    const png = Buffer.concat([Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]), Buffer.from([0x00, 0xff, 0x80, 0x7f])]);
+    const got = await readBinary(fakeSftp(png), '/shot.png');
+    assert.ok(got.equals(png), 'binary bytes must round-trip exactly');
+  });
+  await checkAsync('refuses an oversized binary read', async () => {
+    const sftp = fakeSftp(Buffer.alloc(16), { reportedSize: MAX_OUTPUT * 4 + 1 });
+    await assert.rejects(() => readBinary(sftp, '/huge.png'), /exceeds the binary read limit/);
+  });
+
+  section('file tools');
+  await checkAsync('listDir maps attrs and sorts directories first', async () => {
+    const sftp = {
+      readdir(dir, cb) {
+        cb(null, [
+          { filename: 'z.txt', attrs: { mode: 0o100644, size: 3, mtime: 1700000000 } },
+          { filename: 'a', attrs: { mode: 0o040755, size: 4096, mtime: 1700000000 } },
+          { filename: '.', attrs: {} },
+          { filename: '..', attrs: {} },
+        ]);
+      },
+    };
+    const r = await bridgeWith(sftpOnly(sftp)).listDir('dev01', '/x');
+    assert.strictEqual(r.count, 2, 'dot entries are filtered');
+    assert.strictEqual(r.entries[0].name, 'a');
+    assert.strictEqual(r.entries[0].type, 'dir');
+    assert.strictEqual(r.entries[1].type, 'file');
+    assert.ok(r.entries[1].mtime.endsWith('Z'));
+  });
+
+  function execStub({ code, stdout = '' }) {
+    return () => ({
+      on(ev, fn) { (this.h = this.h || {})[ev] = fn; return this; },
+      connect() { setImmediate(() => this.h.ready()); },
+      end() {},
+      exec(cmd, opts, cb) {
+        execStub.last = cmd;
+        const { EventEmitter } = require('events');
+        const ch = new EventEmitter();
+        ch.stdin = { write: (d, f) => f && f(), end() {} };
+        ch.stderr = new EventEmitter();
+        cb(null, ch);
+        setImmediate(() => {
+          if (stdout) ch.emit('data', Buffer.from(stdout));
+          ch.emit('exit', code);
+          ch.emit('close', code);
+        });
+        return ch;
+      },
+    });
+  }
+
+  await checkAsync('searchFiles treats "no matches" as an empty result, not an error', async () => {
+    const b = createBridge(BASE_CFG, { clientFactory: execStub({ code: 1 }), configFile });
+    const r = await b.searchFiles('dev01', { pattern: 'nothing', path: '/x' });
+    assert.strictEqual(r.count, 0);
+    assert.deepStrictEqual(r.matches, []);
+  });
+  await checkAsync('searchFiles quotes the pattern so it cannot become shell syntax', async () => {
+    const b = createBridge(BASE_CFG, { clientFactory: execStub({ code: 0, stdout: '/a.txt:3:hit\n' }), configFile });
+    const r = await b.searchFiles('dev01', { pattern: "a'; rm -rf /", path: '/x' });
+    // Inside the outer bash -c quoting the payload is escaped; what matters is
+    // that the raw `; rm -rf /` never appears unquoted as shell syntax.
+    const cmd = execStub.last;
+    assert.ok(!/ ;\s*rm -rf \/ /.test(cmd), `pattern leaked as syntax: ${cmd}`);
+    assert.ok(cmd.includes('rm -rf /'), 'pattern text should still be passed through');
+    assert.strictEqual(r.count, 1);
+    assert.strictEqual(r.matches[0].file, '/a.txt');
+    assert.strictEqual(r.matches[0].line, 3);
+  });
+  await checkAsync('searchFiles caps results at maxResults', async () => {
+    const many = Array.from({ length: 50 }, (_, i) => `/f:${i + 1}:x`).join('\n') + '\n';
+    const b = createBridge(BASE_CFG, { clientFactory: execStub({ code: 0, stdout: many }), configFile });
+    const r = await b.searchFiles('dev01', { pattern: 'x', path: '/', maxResults: 5 });
+    assert.strictEqual(r.matches.length, 5);
+    assert.strictEqual(r.truncated, true);
+  });
 
   fs.rmSync(tmp, { recursive: true, force: true });
   console.log(`\n${pass} passed, ${failures.length} failed`);

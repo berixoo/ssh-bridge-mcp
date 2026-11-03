@@ -52,6 +52,7 @@ server.registerTool('run_command', {
     pty: z.boolean().optional().default(false),
     env: z.record(z.string(), z.string()).optional(),
     input: z.string().optional().describe('one-shot stdin, written then closed'),
+    pipefail: z.boolean().optional().default(false).describe('fail when any stage of a pipeline fails; catches `cmd | head` masking a real error'),
   },
 }, async (args) => {
   try {
@@ -90,6 +91,88 @@ server.registerTool('download', {
   inputSchema: { host: hostSchema, remote_path: z.string().min(1), local_path: z.string().min(1) },
 }, async (args) => {
   try { return ok(await bridge.download(args.host, args.remote_path, args.local_path)); } catch (e) { throw toolError(e); }
+});
+
+server.registerTool('list_dir', {
+  description: 'List a remote directory via SFTP. Returns entries with name, type (file/dir/link), size, mtime and mode. Directories sort first. Use this instead of shelling out to ls.',
+  inputSchema: { host: hostSchema, path: z.string().min(1).describe('remote directory') },
+}, async (args) => {
+  try { return ok(await bridge.listDir(args.host, args.path)); } catch (e) { throw toolError(e); }
+});
+
+server.registerTool('search_files', {
+  description: 'Search file contents on the remote host (grep). Returns [{ file, line, text }]. Exit code 1 (no matches) is a normal empty result, not an error.',
+  inputSchema: {
+    host: hostSchema,
+    pattern: z.string().min(1).describe('regex by default; set fixed=true for a literal string'),
+    path: z.string().optional().describe('directory or file to search; default "."'),
+    glob: z.string().optional().describe('limit files, e.g. "*.js" or "*.{ts,tsx}"'),
+    max_results: z.number().int().min(1).max(1000).optional().describe('default 100'),
+    ignore_case: z.boolean().optional().default(false),
+    fixed: z.boolean().optional().default(false).describe('treat pattern as a literal string'),
+  },
+}, async (args) => {
+  try {
+    return ok(await bridge.searchFiles(args.host, {
+      pattern: args.pattern,
+      path: args.path,
+      glob: args.glob,
+      maxResults: args.max_results,
+      ignoreCase: args.ignore_case,
+      fixed: args.fixed,
+    }));
+  } catch (e) { throw toolError(e); }
+});
+
+server.registerTool('rename', {
+  description: 'Move or rename a path on the remote host via SFTP. Creates the destination parent directory.',
+  inputSchema: { host: hostSchema, from: z.string().min(1), to: z.string().min(1) },
+}, async (args) => {
+  try { return ok(await bridge.renamePath(args.host, args.from, args.to)); } catch (e) { throw toolError(e); }
+});
+
+server.registerTool('delete', {
+  description: 'Delete a file, symlink, or empty directory on the remote host via SFTP. Destructive: set recursive=true to remove a directory tree (symlinks inside are unlinked, never followed).',
+  inputSchema: {
+    host: hostSchema,
+    path: z.string().min(1),
+    recursive: z.boolean().optional().default(false),
+  },
+}, async (args) => {
+  try { return ok(await bridge.deletePath(args.host, args.path, { recursive: args.recursive })); } catch (e) { throw toolError(e); }
+});
+
+server.registerTool('screenshot', {
+  description: 'Capture the remote host\'s desktop and return it as an image. Finds the logged-in graphical session itself, so no DISPLAY is needed. Works with GNOME/Wayland (gnome-screenshot over Xwayland), wlroots/sway (grim), and X11 (scrot/imagemagick). Downscaled to max_width and re-encoded as JPEG when ImageMagick is available.',
+  inputSchema: {
+    host: hostSchema,
+    max_width: z.number().int().min(0).max(8000).optional().describe('downscale to this width; 0 = keep original. default 1600'),
+    quality: z.number().int().min(1).max(100).optional().describe('JPEG quality when downscaling. default 82'),
+  },
+}, async (args) => {
+  try {
+    const shot = await bridge.screenshot(args.host, {
+      maxWidth: args.max_width === undefined ? 1600 : args.max_width,
+      quality: args.quality === undefined ? 82 : args.quality,
+    });
+    return {
+      content: [
+        { type: 'image', data: shot.base64, mimeType: shot.mimeType },
+        {
+          type: 'text',
+          text: JSON.stringify({
+            ok: true,
+            bytes: shot.bytes,
+            mimeType: shot.mimeType,
+            optimized: shot.optimized,
+            tool: shot.tool,
+            sessionType: shot.sessionType,
+            display: shot.display,
+          }),
+        },
+      ],
+    };
+  } catch (e) { throw toolError(e); }
 });
 
 server.registerTool('start_background', {

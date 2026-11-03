@@ -1,10 +1,12 @@
 const { Client } = require('ssh2');
 const crypto = require('crypto');
 const fs = require('fs');
+const net = require('net');
 const path = require('path');
 const { resolveHost, knownHostsPaths, configPath } = require('./config');
 const { createKnownHostsStore, verifyHostKey } = require('./hostkeys');
 const { checkLocalPath } = require('./paths');
+const { buildCaptureScript, buildOptimizeScript, parseCaptureResult, looksLikeImage } = require('./screenshot');
 
 const MAX_OUTPUT = 500 * 1024;
 const BG_GRACE_MS = 1500;
@@ -56,12 +58,23 @@ function isNoSuchFile(err) {
   return !!err && (err.code === 2 || /no such file/i.test(err.message || ''));
 }
 
+// True when the SFTP *session* is unusable (as opposed to the operation
+// failing). Only these should discard the cached session and retry.
+function isSftpSessionFailure(err) {
+  const msg = (err && err.message) || '';
+  return /no response from server|connection lost|not connected|channel open|session closed|SFTP channel closed/i.test(msg);
+}
+
 function shq(s) {
   return "'" + s.replace(/'/g, `'\\''`) + "'";
 }
 
-function makeExecCommand({ command, cwd, sudo, env }) {
+function makeExecCommand({ command, cwd, sudo, env, pipefail }) {
   let full = command;
+  // Without pipefail `cat /etc/shadow | head -1` exits 0 even though cat failed,
+  // which reports a permission error as success. Opt-in because it also turns
+  // intentional `cmd | head` SIGPIPE exits into failures.
+  if (pipefail) full = `set -o pipefail; ${full}`;
   if (env && Object.keys(env).length > 0) {
     // ssh2's opts.env is delivered via SSH env channel requests, which
     // OpenSSH ignores for exec sessions by default (PermitUserEnvironment
@@ -146,6 +159,88 @@ function statRemote(sftp, file) {
   );
 }
 
+function readdirRemote(sftp, dir) {
+  return new Promise((resolve, reject) =>
+    sftp.readdir(dir, (e, list) => (e ? reject(new Error(`list_dir ${dir}: ${e.message}`)) : resolve(list)))
+  );
+}
+
+const S_IFMT = 0o170000;
+const S_IFDIR = 0o040000;
+const S_IFLNK = 0o120000;
+
+// Works for ssh2 Stats instances and for plain {mode} objects alike.
+function isDirMode(attrs) {
+  if (!attrs || typeof attrs.mode !== 'number') return false;
+  if (typeof attrs.isDirectory === 'function') return attrs.isDirectory();
+  return (attrs.mode & S_IFMT) === S_IFDIR;
+}
+function isLinkMode(attrs) {
+  if (!attrs || typeof attrs.mode !== 'number') return false;
+  if (typeof attrs.isSymbolicLink === 'function') return attrs.isSymbolicLink();
+  return (attrs.mode & S_IFMT) === S_IFLNK;
+}
+
+function unlinkRemote(sftp, file) {
+  return new Promise((resolve, reject) =>
+    sftp.unlink(file, (e) => (e ? reject(new Error(`delete ${file}: ${e.message}`)) : resolve()))
+  );
+}
+
+function rmdirRemote(sftp, dir) {
+  return new Promise((resolve, reject) =>
+    sftp.rmdir(dir, (e) => (e ? reject(new Error(`delete ${dir}: ${e.message}`)) : resolve()))
+  );
+}
+
+function renameRemote(sftp, from, to) {
+  return new Promise((resolve, reject) =>
+    sftp.rename(from, to, (e) => (e ? reject(new Error(`rename ${from} -> ${to}: ${e.message}`)) : resolve()))
+  );
+}
+
+// Reads a file as raw bytes, capped. readFrom() decodes as utf8 and would
+// corrupt a PNG, so binary transfers get their own path.
+function readBinary(sftp, file) {
+  return new Promise((resolve, reject) => {
+    sftp.open(file, 'r', (e, h) => {
+      if (e) return reject(new Error(`read ${file}: ${e.message}`));
+      const done = (fn) => sftp.close(h, () => fn());
+      sftp.fstat(h, (e2, st) => {
+        if (e2) return done(() => reject(new Error(`stat ${file}: ${e2.message}`)));
+        if (st.size > MAX_OUTPUT * 4) {
+          return done(() => reject(new Error(`read ${file}: ${st.size} bytes exceeds the binary read limit`)));
+        }
+        const buf = Buffer.alloc(Math.max(1, st.size));
+        sftp.read(h, buf, 0, buf.length, 0, (e3, bytes) => {
+          if (e3) return done(() => reject(new Error(`read ${file}: ${e3.message}`)));
+          done(() => resolve(buf.subarray(0, bytes)));
+        });
+      });
+    });
+  });
+}
+
+function imageMime(buf) {
+  return buf.slice(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]))
+    ? 'image/png'
+    : 'image/jpeg';
+}
+
+// Depth-first removal used by deletePath({recursive:true}). Symlinks are
+// unlinked, never followed -- following one could delete files outside the tree
+// the caller asked to remove.
+async function removeTree(sftp, dir) {
+  const list = await readdirRemote(sftp, dir);
+  for (const e of list) {
+    if (e.filename === '.' || e.filename === '..') continue;
+    const full = path.posix.join(dir, e.filename);
+    if (isDirMode(e.attrs)) await removeTree(sftp, full);
+    else await unlinkRemote(sftp, full);
+  }
+  await rmdirRemote(sftp, dir);
+}
+
 // fastGet's read loop is bounded by the file size it works from, so handing it
 // the size we already checked turns the limit into a hard ceiling: a remote
 // that lied in stat() still cannot push more than that many bytes. (ssh2
@@ -181,8 +276,33 @@ function killProcessGroup(client, pidFile) {
   });
 }
 
-function createBridge(cfg, { clientFactory = () => new Client(), configFile = configPath() } = {}) {
+function defaultClientFactory(opts = {}) {
+  return new Client(opts);
+}
+
+// A socket ssh2 will use instead of creating its own, so Nagle can be disabled
+// before the handshake. Windows' Nagle + delayed-ACK interaction costs ~170 ms
+// per round trip on this workload. ssh2 assumes a supplied socket is already
+// connected, so connect it here and hand it over once the TCP handshake lands.
+function connectSocket(host, port) {
+  return new Promise((resolve, reject) => {
+    const sock = new net.Socket();
+    sock.setNoDelay(true);
+    // Keep an idle pooled connection alive instead of letting the server or a
+    // NAT drop it between agent turns.
+    sock.setKeepAlive(true, 30000);
+    sock.once('connect', () => {
+      sock.removeListener('error', reject);
+      resolve(sock);
+    });
+    sock.once('error', reject);
+    sock.connect({ host, port });
+  });
+}
+
+function createBridge(cfg, { clientFactory = defaultClientFactory, configFile = configPath() } = {}) {
   const conns = new Map();
+  const sftps = new Map();
   const tasks = new Map();
   const hostKeys = createKnownHostsStore(knownHostsPaths(cfg, configFile));
 
@@ -194,6 +314,7 @@ function createBridge(cfg, { clientFactory = () => new Client(), configFile = co
     return /channel open|open failed/i.test((err && err.message) || '');
   }
   function dispose(name) {
+    dropSftp(name);
     const p = conns.get(name);
     if (!p) return;
     conns.delete(name);
@@ -211,47 +332,59 @@ function createBridge(cfg, { clientFactory = () => new Client(), configFile = co
 
   function getConn(name) {
     if (conns.has(name)) return conns.get(name);
-    const p = new Promise((resolve, reject) => {
+    const p = (async () => {
       const entry = resolveHost(cfg, name);
-      const client = clientFactory({});
-      let ready = false;
-      // hostVerifier has no error channel, so a rejection reason is parked here
-      // and surfaced through the 'error' event that follows it. Without this the
-      // user only sees ssh2's generic "Host denied (verification failed)".
-      let hostKeyFailure = null;
-      client.on('ready', () => { ready = true; resolve(client); });
-      client.on('error', (err) => reject(new Error(`SSH connection to ${entry.name} failed: ${hostKeyFailure || err.message}`)));
-      // A connection that closes is dead: if it never became ready the pending
-      // promise must not hang, and once ready the pool must drop it so the
-      // next call rebuilds instead of reusing a stale client.
-      client.on('close', () => {
-        if (!ready) reject(new Error(`SSH connection to ${entry.name} closed before ready`));
-        if (conns.get(name) === p) conns.delete(name);
+      // ssh2 creates its own socket and never disables Nagle. On Windows that
+      // combination (Nagle + delayed ACK) puts a ~170 ms stall on every small
+      // request/response: 20 serial SFTP ops measured 3363 ms with it and 34 ms
+      // without. Each tool call issues several round trips, so this is the
+      // single biggest latency fix in the bridge. Tests inject clientFactory
+      // and get no socket, so the fakes keep working.
+      const sock = clientFactory === defaultClientFactory
+        ? await connectSocket(entry.host, entry.port)
+        : undefined;
+      return await new Promise((resolve, reject) => {
+        const client = clientFactory({ sock });
+        let ready = false;
+        // hostVerifier has no error channel, so a rejection reason is parked here
+        // and surfaced through the 'error' event that follows it. Without this the
+        // user only sees ssh2's generic "Host denied (verification failed)".
+        let hostKeyFailure = null;
+        client.on('ready', () => { ready = true; resolve(client); });
+        client.on('error', (err) => reject(new Error(`SSH connection to ${entry.name} failed: ${hostKeyFailure || err.message}`)));
+        // A connection that closes is dead: if it never became ready the pending
+        // promise must not hang, and once ready the pool must drop it so the
+        // next call rebuilds instead of reusing a stale client.
+        client.on('close', () => {
+          if (!ready) reject(new Error(`SSH connection to ${entry.name} closed before ready`));
+          if (conns.get(name) === p) conns.delete(name);
+        });
+        client.connect({
+          host: entry.host,
+          port: entry.port,
+          username: entry.user,
+          password: entry.password,
+          readyTimeout: 15000,
+          sock,
+          algorithms: connectAlgorithms(cfg),
+          // ssh2 auto-accepts whatever host key answers unless this is set, which
+          // would hand the password to an impersonator on the LAN.
+          hostVerifier: (blob) => {
+            const verdict = verifyHostKey({
+              store: hostKeys,
+              policy: entry.hostKeyPolicy,
+              host: entry.host,
+              port: entry.port,
+              blob,
+              label: entry.name,
+              pinnedFingerprint: entry.hostKeyFingerprint,
+            });
+            if (!verdict.ok) hostKeyFailure = verdict.message;
+            return verdict.ok;
+          },
+        });
       });
-      client.connect({
-        host: entry.host,
-        port: entry.port,
-        username: entry.user,
-        password: entry.password,
-        readyTimeout: 15000,
-        algorithms: connectAlgorithms(cfg),
-        // ssh2 auto-accepts whatever host key answers unless this is set, which
-        // would hand the password to an impersonator on the LAN.
-        hostVerifier: (blob) => {
-          const verdict = verifyHostKey({
-            store: hostKeys,
-            policy: entry.hostKeyPolicy,
-            host: entry.host,
-            port: entry.port,
-            blob,
-            label: entry.name,
-            pinnedFingerprint: entry.hostKeyFingerprint,
-          });
-          if (!verdict.ok) hostKeyFailure = verdict.message;
-          return verdict.ok;
-        },
-      });
-    }).catch((err) => {
+    })().catch((err) => {
       conns.delete(name);
       throw err;
     });
@@ -259,14 +392,42 @@ function createBridge(cfg, { clientFactory = () => new Client(), configFile = co
     return p;
   }
 
+  // One cached SFTP session per host. Opening one per call burned a channel and
+  // a round trip on every file operation; on a long agent session that is both
+  // slow and a MaxSessions risk. The session is reused until an operation on it
+  // fails, at which point withSftp() drops it and retries once on a fresh one.
   async function getSftp(name) {
+    if (sftps.has(name)) return sftps.get(name);
     const client = await getConn(name);
-    return new Promise((resolve, reject) =>
+    const p = new Promise((resolve, reject) =>
       client.sftp((e, s) => (e ? reject(e) : resolve(s)))
     );
+    sftps.set(name, p);
+    p.catch(() => { if (sftps.get(name) === p) sftps.delete(name); });
+    return p;
   }
 
-  function execChannel(client, { command, cwd, timeoutMs, sudo, pty, env, input, sudoPassword }) {
+  function dropSftp(name) {
+    const p = sftps.get(name);
+    if (!p) return;
+    sftps.delete(name);
+    p.then((s) => { try { s.end(); } catch (_) {} }).catch(() => {});
+  }
+
+  // Runs fn(sftp) and, if the session itself turns out to be dead, rebuilds it
+  // once. Only the SFTP-level failure triggers this; ordinary errors (a missing
+  // file, a permission denial) are passed straight through.
+  async function withSftp(name, fn) {
+    try {
+      return await fn(await getSftp(name));
+    } catch (err) {
+      if (!isSftpSessionFailure(err)) throw err;
+      dropSftp(name);
+      return fn(await getSftp(name));
+    }
+  }
+
+  function execChannel(client, { command, cwd, timeoutMs, sudo, pty, env, input, pipefail, sudoPassword }) {
     // Every non-pty command runs through `bash -c` so a timeout can kill the
     // whole process tree via killProcessGroup. setsid is avoided entirely:
     // util-linux setsid forks, which swallows the exit code and redirects
@@ -279,12 +440,12 @@ function createBridge(cfg, { clientFactory = () => new Client(), configFile = co
     const pidFile = wrap ? `/tmp/ssh-bridge-pid-${crypto.randomBytes(6).toString('hex')}` : null;
     let full;
     if (wrap) {
-      const inner = makeExecCommand({ command, cwd, sudo, env });
+      const inner = makeExecCommand({ command, cwd, sudo, env, pipefail });
       const capture = `echo $$ > ${pidFile}; trap 'rm -f ${pidFile}' EXIT;\n`;
       full = `bash -c ${shq(capture + inner)}`;
     } else {
       // pty: no extra wrapper (EPERM), apply cwd/sudo directly.
-      full = makeExecCommand({ command, cwd, sudo, env });
+      full = makeExecCommand({ command, cwd, sudo, env, pipefail });
     }
     const opts = {};
     if (pty) opts.pty = { rows: 40, cols: 200, term: 'xterm-256color' };
@@ -424,25 +585,102 @@ function createBridge(cfg, { clientFactory = () => new Client(), configFile = co
     }));
   }
 
-  function readFile(name, file) {
-    return withRetry(name, async () => {
-      const s = await getSftp(name);
-      try {
-        const r = await readFrom(s, file, 0);
-        if (r.error) throw new Error(`read_file ${file}: ${r.error.message}`);
-        // sftp.readFile pulls the whole file into memory with no bound, so a
-        // prompt-injected path (say /var/log/huge.log) could OOM the server.
-        // The tool is documented as small-text-files only.
-        if (r.truncated) {
-          throw new Error(
-            `read_file ${file}: not read completely -- the file exceeds the ${MAX_OUTPUT}-byte limit for read_file; use download for large files`
-          );
+  function listDir(name, dir) {
+    return withRetry(name, () => withSftp(name, async (s) => {
+      const list = await readdirRemote(s, dir);
+      const entries = list
+        .filter((e) => e.filename !== '.' && e.filename !== '..')
+        .map((e) => ({
+          name: e.filename,
+          type: isDirMode(e.attrs) ? 'dir' : isLinkMode(e.attrs) ? 'link' : 'file',
+          size: e.attrs.size,
+          mtime: e.attrs.mtime ? new Date(e.attrs.mtime * 1000).toISOString() : null,
+          mode: e.attrs.mode ? '0' + (e.attrs.mode & 0o777).toString(8) : null,
+        }))
+        .sort((a, b) => (a.type === b.type ? a.name.localeCompare(b.name) : a.type === 'dir' ? -1 : b.type === 'dir' ? 1 : 0));
+      return { path: dir, count: entries.length, entries };
+    }));
+  }
+
+  // Deletion is the one destructive operation, so it is explicit about what it
+  // did: a missing path is reported, not silently treated as success, and a
+  // non-empty directory is never removed implicitly.
+  async function deletePath(name, target, { recursive = false } = {}) {
+    return withRetry(name, () => withSftp(name, async (s) => {
+      const st = await statRemote(s, target);
+      if (isDirMode(st)) {
+        if (recursive) {
+          await removeTree(s, target);
+          return { ok: true, removed: 'dir', recursive: true };
         }
-        return { content: r.content };
-      } finally {
-        try { s.end(); } catch (_) {}
+        await rmdirRemote(s, target);
+        return { ok: true, removed: 'dir' };
       }
+      await unlinkRemote(s, target);
+      return { ok: true, removed: 'file' };
+    }));
+  }
+
+  async function renamePath(name, from, to) {
+    return withRetry(name, () => withSftp(name, async (s) => {
+      await mkdirp(s, path.posix.dirname(to));
+      await renameRemote(s, from, to);
+      return { ok: true, from, to };
+    }));
+  }
+
+  // Search file contents on the remote host. Prefers ripgrep (fast, respects
+  // .gitignore, has --glob) and falls back to grep -r. Patterns are shell-quoted,
+  // so the model's text never becomes shell syntax.
+  function searchFiles(name, { pattern, path: dir = '.', glob, maxResults = 100, ignoreCase = false, fixed = false }) {
+    if (!pattern) throw new Error('search_files requires a pattern');
+    const entry = resolveHost(cfg, name);
+    const max = Math.max(1, Math.min(maxResults, 1000));
+    const rgArgs = ['--color=never', '--line-number', '--no-heading', '--with-filename'];
+    if (ignoreCase) rgArgs.push('--ignore-case');
+    if (fixed) rgArgs.push('--fixed-strings');
+    if (glob) rgArgs.push('--glob', glob);
+    rgArgs.push('--max-count', String(max), '--', pattern, dir);
+    const cmd = `if command -v rg >/dev/null 2>&1; then rg ${rgArgs.map(shq).join(' ')}; else ` +
+      `grep ${[
+        '-r', '--color=never', '--line-number', '--with-filename',
+        ignoreCase ? '--ignore-case' : null,
+        fixed ? '--fixed-strings' : null,
+        `--max-count=${max}`,
+        '--exclude-dir=.git',
+        '--', pattern, dir,
+      ].filter(Boolean).map(shq).join(' ')}; fi`;
+    return withRetry(entry.name, async () => {
+      const r = await runCommand(entry.name, { command: cmd, timeoutMs: 60000 });
+      // grep and ripgrep both use 0 = matches, 1 = none, 2 = error.
+      if (r.exitCode === 1) return { matches: [], count: 0 };
+      if (r.exitCode !== 0) throw new Error(`search_files: ${(r.stderr || 'search failed').trim()}`);
+      const all = r.stdout.split(/\r?\n/).filter(Boolean).map((line) => {
+        const m = line.match(/^(.*?):(\d+):(.*)$/);
+        return m ? { file: m[1], line: Number(m[2]), text: m[3] } : { file: null, line: null, text: line };
+      });
+      return {
+        matches: all.slice(0, max),
+        count: Math.min(all.length, max),
+        truncated: r.truncated === true || all.length > max,
+      };
     });
+  }
+
+  function readFile(name, file) {
+    return withRetry(name, () => withSftp(name, async (s) => {
+      const r = await readFrom(s, file, 0);
+      if (r.error) throw new Error(`read_file ${file}: ${r.error.message}`);
+      // sftp.readFile pulls the whole file into memory with no bound, so a
+      // prompt-injected path (say /var/log/huge.log) could OOM the server.
+      // The tool is documented as small-text-files only.
+      if (r.truncated) {
+        throw new Error(
+          `read_file ${file}: not read completely -- the file exceeds the ${MAX_OUTPUT}-byte limit for read_file; use download for large files`
+        );
+      }
+      return { content: r.content };
+    }));
   }
 
   async function writeRemoteFile(sftp, file, content) {
@@ -456,67 +694,52 @@ function createBridge(cfg, { clientFactory = () => new Client(), configFile = co
   }
 
   function writeFile(name, file, content) {
-    return withRetry(name, async () => {
-      const s = await getSftp(name);
-      try {
-        await writeRemoteFile(s, file, content);
-        return { ok: true };
-      } finally {
-        try { s.end(); } catch (_) {}
-      }
-    });
+    return withRetry(name, () => withSftp(name, async (s) => {
+      await writeRemoteFile(s, file, content);
+      return { ok: true };
+    }));
   }
 
   // async so a policy rejection arrives as a rejected promise like every other
   // bridge method, rather than throwing synchronously out of the call.
   async function upload(name, localPath, remotePath) {
     const local = checkLocalPath({ localPath, cfg, configFile, tool: 'upload' });
-    return withRetry(name, async () => {
-      const s = await getSftp(name);
-      try {
-        await mkdirp(s, path.posix.dirname(remotePath));
-        await new Promise((resolve, reject) =>
-          s.fastPut(local, remotePath, (e) =>
-            e ? reject(new Error(`upload: ${e.message}`)) : resolve()
-          )
-        );
-        return { ok: true };
-      } finally {
-        try { s.end(); } catch (_) {}
-      }
-    });
+    return withRetry(name, () => withSftp(name, async (s) => {
+      await mkdirp(s, path.posix.dirname(remotePath));
+      await new Promise((resolve, reject) =>
+        s.fastPut(local, remotePath, (e) =>
+          e ? reject(new Error(`upload: ${e.message}`)) : resolve()
+        )
+      );
+      return { ok: true };
+    }));
   }
 
   async function download(name, remotePath, localPath) {
     const local = checkLocalPath({ localPath, cfg, configFile, tool: 'download' });
     const limit = downloadLimit(cfg);
-    return withRetry(name, async () => {
-      const s = await getSftp(name);
-      try {
-        const st = await statRemote(s, remotePath);
-        // Checked before a byte moves: a hostile or broken remote could
-        // otherwise stream until the local disk is full.
-        if (limit > 0 && st.size > limit) {
-          throw new Error(
-            `download ${remotePath}: ${st.size} bytes exceeds maxDownloadBytes (${limit}); ` +
-              'raise "maxDownloadBytes" in the server config (0 = unlimited) if the file is legitimate'
-          );
-        }
-        fs.mkdirSync(path.dirname(local), { recursive: true });
-        await fastGetInto(s, remotePath, local, st.size);
-        // A download that quietly wrote fewer bytes than the file holds is the
-        // same class of silent loss this bridge has been fixed for elsewhere.
-        if (st.size > 0) {
-          const written = fs.statSync(local).size;
-          if (written !== st.size) {
-            throw new Error(`download ${remotePath}: wrote ${written} of ${st.size} bytes`);
-          }
-        }
-        return { ok: true };
-      } finally {
-        try { s.end(); } catch (_) {}
+    return withRetry(name, () => withSftp(name, async (s) => {
+      const st = await statRemote(s, remotePath);
+      // Checked before a byte moves: a hostile or broken remote could
+      // otherwise stream until the local disk is full.
+      if (limit > 0 && st.size > limit) {
+        throw new Error(
+          `download ${remotePath}: ${st.size} bytes exceeds maxDownloadBytes (${limit}); ` +
+            'raise "maxDownloadBytes" in the server config (0 = unlimited) if the file is legitimate'
+        );
       }
-    });
+      fs.mkdirSync(path.dirname(local), { recursive: true });
+      await fastGetInto(s, remotePath, local, st.size);
+      // A download that quietly wrote fewer bytes than the file holds is the
+      // same class of silent loss this bridge has been fixed for elsewhere.
+      if (st.size > 0) {
+        const written = fs.statSync(local).size;
+        if (written !== st.size) {
+          throw new Error(`download ${remotePath}: wrote ${written} of ${st.size} bytes`);
+        }
+      }
+      return { ok: true };
+    }));
   }
 
   function startBackground(name, { command, cwd }) {
@@ -526,12 +749,7 @@ function createBridge(cfg, { clientFactory = () => new Client(), configFile = co
     const outFile = `/tmp/ssh-bridge-${taskId}.out`;
     const pidFile = `/tmp/ssh-bridge-${taskId}.pid`;
     return withRetry(entry.name, async () => {
-      const s = await getSftp(entry.name);
-      try {
-        await writeRemoteFile(s, scriptFile, command);
-      } finally {
-        try { s.end(); } catch (_) {}
-      }
+      await withSftp(entry.name, (s) => writeRemoteFile(s, scriptFile, command));
       // </dev/null + redirected stdio detach the process from the channel so it
       // cannot hold an ssh session open (which would exhaust MaxSessions).
       const run = `cd ${shq(cwd || '.')} && nohup bash ${shq(scriptFile)} > ${outFile} 2>&1 < /dev/null & echo $! > ${pidFile}`;
@@ -561,13 +779,7 @@ function createBridge(cfg, { clientFactory = () => new Client(), configFile = co
     const t = tasks.get(taskId);
     if (!t) throw new Error(`unknown task_id ${taskId}`);
     return withRetry(t.hostName, async () => {
-      const s = await getSftp(t.hostName);
-      let r;
-      try {
-        r = await readFrom(s, t.outFile, t.offset);
-      } finally {
-        try { s.end(); } catch (_) {}
-      }
+      const r = await withSftp(t.hostName, (s) => readFrom(s, t.outFile, t.offset));
       // A log file that does not exist yet still means "no output", as before;
       // any other read failure must not be reported as an idle task.
       if (r.error && !isNoSuchFile(r.error)) {
@@ -580,6 +792,57 @@ function createBridge(cfg, { clientFactory = () => new Client(), configFile = co
       const alive = await runCommand(t.hostName, { command: `kill -0 ${t.pid} 2>/dev/null || true`, timeoutMs: 5000 });
       // truncated means the producer outran us: poll again for the remainder.
       return { content: r.content, running: alive.exitCode === 0, truncated: r.truncated === true };
+    });
+  }
+
+  async function screenshot(name, { maxWidth = 1600, quality = 82 } = {}) {
+    const entry = resolveHost(cfg, name);
+    const remotePath = `/tmp/ssh-bridge-shot-${crypto.randomBytes(6).toString('hex')}.png`;
+    const optimizedPath = remotePath.replace(/\.png$/, '.jpg');
+    return withRetry(entry.name, async () => {
+      // The capture script runs through bash -c with the output path as $1, so
+      // no path ever gets interpolated into shell text.
+      const r = await runCommand(entry.name, {
+        command: `bash -c ${shq(buildCaptureScript())} ssh-bridge-capture ${shq(remotePath)}`,
+        timeoutMs: 90000,
+      });
+      const result = parseCaptureResult(r.stdout);
+      if (!result.ok) throw new Error(`screenshot ${entry.name}: ${result.error}`);
+
+      let readPath = remotePath;
+      let data;
+      try {
+        // Shrink before transferring: a full desktop PNG is ~1.7 MB and the
+        // same frame at 1600px/quality 82 is ~30 KB.
+        if (maxWidth > 0) {
+          const o = await runCommand(entry.name, {
+            command: `bash -c ${shq(buildOptimizeScript())} ssh-bridge-optimize ${shq(remotePath)} ${shq(optimizedPath)} ${shq(String(maxWidth))} ${shq(String(quality))}`,
+            timeoutMs: 30000,
+          });
+          if (String(o.stdout).includes('OPTIMIZED')) readPath = optimizedPath;
+        }
+        data = await withSftp(entry.name, (s) => readBinary(s, readPath));
+      } finally {
+        runCommand(entry.name, {
+          command: `rm -f ${shq(remotePath)} ${shq(optimizedPath)}`,
+          timeoutMs: 5000,
+        }).catch(() => {});
+      }
+      if (!looksLikeImage(data)) {
+        throw new Error(
+          `screenshot ${entry.name}: capture reported success via ${result.tool} but the file is not a ` +
+            'valid image (a blank or zero-filled capture usually means the tool could not reach the display)'
+        );
+      }
+      return {
+        mimeType: imageMime(data),
+        base64: data.toString('base64'),
+        bytes: data.length,
+        optimized: readPath === optimizedPath,
+        tool: result.tool,
+        sessionType: result.sessionType,
+        display: result.display,
+      };
     });
   }
 
@@ -600,8 +863,13 @@ function createBridge(cfg, { clientFactory = () => new Client(), configFile = co
     runCommand,
     readFile,
     writeFile,
+    listDir,
+    deletePath,
+    renamePath,
+    searchFiles,
     upload,
     download,
+    screenshot,
     startBackground,
     backgroundLogs,
     stopBackground,
@@ -616,7 +884,12 @@ module.exports = {
   killProcessGroup,
   isNoSuchFile,
   readFrom,
+  readBinary,
   statRemote,
+  readdirRemote,
+  removeTree,
+  isDirMode,
+  isLinkMode,
   connectAlgorithms,
   downloadLimit,
   SHA1_REMOVALS,

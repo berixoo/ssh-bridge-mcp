@@ -66,19 +66,46 @@ claude mcp add ssh-bridge -- node <path-to>/ssh-bridge-mcp/src/server.js
 
 ## 工具
 
+本 server 面向**可信环境**（自用局域网 + 本地虚拟机），因此给了完整的操作能力：任意 shell 命令、sudo 提权、文件读写/搜索/删除、桌面截图。
+
 | 工具 | 作用 |
 |---|---|
 | `list_hosts` | 列出可用主机名与地址（不含任何凭据） |
 | `run_command` | 运行 shell 命令，返回 `{ exitCode, stdout, stderr }` |
 | `read_file` | 读远程文本文件（上限 500 KB，超了报错；大文件用 `download`） |
 | `write_file` | 写远程文本文件，自动建目录（面向文本/小文件；大文件用 `upload`） |
+| `list_dir` | 列远程目录（SFTP），返回名称/类型/大小/mtime/权限，目录排前 |
+| `search_files` | 远程搜索文件内容（优先 ripgrep，退回 grep -r），返回 `{file, line, text}` |
+| `rename` | 移动/重命名路径（SFTP），自动建目标父目录 |
+| `delete` | 删除文件/符号链接/空目录；`recursive: true` 删整棵树（链接只解除不跟随） |
+| `screenshot` | 截取远程桌面，**直接返回图片**给模型看 |
 | `upload` | 本机 -> Linux，SFTP 传文件（大文件/目录）。配了 `localRoots` 时本机路径须落在其中 |
 | `download` | Linux -> 本机，SFTP 传文件（大文件/目录）。超过 `maxDownloadBytes`（默认 2 GiB）拒绝；配了 `localRoots` 时本机路径须落在其中 |
 | `start_background` | 启动长驻进程（dev server、训练任务），返回 `task_id` |
 | `background_logs` | 读后台进程日志（增量，从上次读的位置起；`truncated: true` 表示还有，继续调） |
 | `stop_background` | 终止后台进程 |
 
-`run_command` 参数：`host` / `command` / `cwd` / `timeout_ms` / `sudo` / `pty` / `env` / `input`。`host` 可省略，缺省连配置的默认主机。
+`run_command` 参数：`host` / `command` / `cwd` / `timeout_ms` / `sudo` / `pty` / `env` / `input` / `pipefail`。`host` 可省略，缺省连配置的默认主机。
+
+### 截图
+
+`screenshot` 不需要你传 `DISPLAY`：它自己去 `loginctl` 找当前用户**已登录的图形会话**（远程 SSH 会话是 `tty` 类型，没有显示器，会被跳过），再按会话类型选工具：
+
+- GNOME/Wayland → `gnome-screenshot` 走 Xwayland（配合 mutter 的 auth 文件）
+- wlroots/sway/KDE → `grim` / `spectacle`
+- X11 → `scrot` / `maim` / `imagemagick`
+
+每次尝试都有超时（`gnome-screenshot` 在其 D-Bus 路径失败后会无限挂住）。默认缩到 1600px、JPEG q82 再传：实测全屏 PNG 1.7 MB → 31 KB，耗时不变。要原图传 `max_width: 0`。
+
+> 在 Ubuntu 24.04 + GNOME 46 上实测：`org.gnome.Shell.Screenshot` 的 D-Bus 调用被拒绝（GNOME 41+ 只允许本机会话），`grim` 报 compositor 不支持 wlroots 协议，`import` 读不到 X root；**只有 gnome-screenshot + Xwayland 可用**。这些失败原因写进了 [[GOTCHAS]]。
+
+### 性能与稳定性
+
+- **TCP_NODELAY**：ssh2 自建 socket 且不关 Nagle，Windows 上 Nagle + 延迟 ACK 让每次小往返卡 ~170 ms。现在自己建 socket 并 `setNoDelay(true)`，实测 40 次 `list_dir` 从 6810 ms 降到 **59 ms**。
+- **SFTP 会话复用**：每个 host 缓存一条 SFTP 会话（原来是每次调用新建），失败时丢弃并重建一次。20 个并发 `write_file` 只需 50 ms。
+- **TCP keepalive**：空闲连接每 30 s 探活，避免跨 agent 轮次被 NAT 掐断。
+- **`pipefail`**（可选）：`cat /etc/shadow | head -1` 默认会以 0 退出，把权限错误报成成功；传 `pipefail: true` 可让管道任一段失败即失败。默认关，因为会改变 `cmd | head` 的正常行为。
+
 
 ## 安全边界
 
