@@ -58,6 +58,35 @@ function isNoSuchFile(err) {
   return !!err && (err.code === 2 || /no such file/i.test(err.message || ''));
 }
 
+// SFTP status codes as ssh2 assigns them (lib/protocol/SFTP.js STATUS_CODE).
+// ssh2 puts the *number* in err.code and a short, often useless message like
+// "Failure" in err.message, so the code is the only reliable signal. These are
+// protocol status codes, not POSIX errno -- EISDIR/ENOTDIR never appear here.
+const SFTP_STATUS = {
+  1: 'EOF',
+  2: 'NO_SUCH_FILE',
+  3: 'PERMISSION_DENIED',
+  4: 'FAILURE',
+  5: 'BAD_MESSAGE',
+  6: 'NO_CONNECTION',
+  7: 'CONNECTION_LOST',
+  8: 'OP_UNSUPPORTED',
+};
+
+// Turns an ssh2 SFTP error into a message an agent can branch on. "Failure"
+// (code 4) is what the server returns for EISDIR/ENOTEMPTY and similar cases
+// that SFTP has no dedicated status for, so the caller's own context is added
+// to disambiguate: whether the path is a directory or a file is known at the
+// call site.
+function describeSftpError(err) {
+  if (!err) return 'unknown error';
+  const code = typeof err.code === 'number' ? err.code : null;
+  const name = code === null ? null : SFTP_STATUS[code];
+  if (!name) return err.message || String(err);
+  const msg = err.message && err.message !== name ? `${err.message}` : '';
+  return msg ? `${name} (${msg})` : name;
+}
+
 // True when the SFTP *session* is unusable (as opposed to the operation
 // failing). Only these should discard the cached session and retry.
 function isSftpSessionFailure(err) {
@@ -153,15 +182,26 @@ function readFrom(sftp, file, offset) {
   });
 }
 
+// Wraps an ssh2 SFTP error in a message that names the failure, while keeping
+// the numeric status code reachable as .code. Callers need the code to add
+// context (is this a directory? is that directory non-empty?) and to decide
+// whether a retry or a different call would help.
+function sftpError(prefix, err) {
+  const wrapped = new Error(`${prefix}: ${describeSftpError(err)}`);
+  if (err && typeof err.code !== 'undefined') wrapped.code = err.code;
+  wrapped.status = err && typeof err.code === 'number' ? SFTP_STATUS[err.code] : undefined;
+  return wrapped;
+}
+
 function statRemote(sftp, file) {
   return new Promise((resolve, reject) =>
-    sftp.stat(file, (e, st) => (e ? reject(new Error(`stat ${file}: ${e.message}`)) : resolve(st)))
+    sftp.stat(file, (e, st) => (e ? reject(sftpError(`stat ${file}`, e)) : resolve(st)))
   );
 }
 
 function readdirRemote(sftp, dir) {
   return new Promise((resolve, reject) =>
-    sftp.readdir(dir, (e, list) => (e ? reject(new Error(`list_dir ${dir}: ${e.message}`)) : resolve(list)))
+    sftp.readdir(dir, (e, list) => (e ? reject(sftpError(`list_dir ${dir}`, e)) : resolve(list)))
   );
 }
 
@@ -183,19 +223,19 @@ function isLinkMode(attrs) {
 
 function unlinkRemote(sftp, file) {
   return new Promise((resolve, reject) =>
-    sftp.unlink(file, (e) => (e ? reject(new Error(`delete ${file}: ${e.message}`)) : resolve()))
+    sftp.unlink(file, (e) => (e ? reject(sftpError(`delete ${file}`, e)) : resolve()))
   );
 }
 
 function rmdirRemote(sftp, dir) {
   return new Promise((resolve, reject) =>
-    sftp.rmdir(dir, (e) => (e ? reject(new Error(`delete ${dir}: ${e.message}`)) : resolve()))
+    sftp.rmdir(dir, (e) => (e ? reject(sftpError(`delete ${dir}`, e)) : resolve()))
   );
 }
 
 function renameRemote(sftp, from, to) {
   return new Promise((resolve, reject) =>
-    sftp.rename(from, to, (e) => (e ? reject(new Error(`rename ${from} -> ${to}: ${e.message}`)) : resolve()))
+    sftp.rename(from, to, (e) => (e ? reject(sftpError(`rename ${from} -> ${to}`, e)) : resolve()))
   );
 }
 
@@ -204,16 +244,16 @@ function renameRemote(sftp, from, to) {
 function readBinary(sftp, file) {
   return new Promise((resolve, reject) => {
     sftp.open(file, 'r', (e, h) => {
-      if (e) return reject(new Error(`read ${file}: ${e.message}`));
+      if (e) return reject(sftpError(`read ${file}`, e));
       const done = (fn) => sftp.close(h, () => fn());
       sftp.fstat(h, (e2, st) => {
-        if (e2) return done(() => reject(new Error(`stat ${file}: ${e2.message}`)));
+        if (e2) return done(() => reject(sftpError(`stat ${file}`, e2)));
         if (st.size > MAX_OUTPUT * 4) {
           return done(() => reject(new Error(`read ${file}: ${st.size} bytes exceeds the binary read limit`)));
         }
         const buf = Buffer.alloc(Math.max(1, st.size));
         sftp.read(h, buf, 0, buf.length, 0, (e3, bytes) => {
-          if (e3) return done(() => reject(new Error(`read ${file}: ${e3.message}`)));
+          if (e3) return done(() => reject(sftpError(`read ${file}`, e3)));
           done(() => resolve(buf.subarray(0, bytes)));
         });
       });
@@ -249,7 +289,7 @@ function fastGetInto(sftp, remotePath, localPath, size) {
   return new Promise((resolve, reject) => {
     const opts = size > 0 ? { fileSize: size } : {};
     sftp.fastGet(remotePath, localPath, opts, (e) =>
-      e ? reject(new Error(`download: ${e.message}`)) : resolve()
+      e ? reject(sftpError('download', e)) : resolve()
     );
   });
 }
@@ -587,7 +627,22 @@ function createBridge(cfg, { clientFactory = defaultClientFactory, configFile = 
 
   function listDir(name, dir) {
     return withRetry(name, () => withSftp(name, async (s) => {
-      const list = await readdirRemote(s, dir);
+      let list;
+      try {
+        list = await readdirRemote(s, dir);
+      } catch (err) {
+        // SFTP answers OPENDIR on a regular file with NO_SUCH_FILE (2), which
+        // reads as "the path is wrong" even though the path exists and is just
+        // a file. Check and say so.
+        if (err.code === 2) {
+          const st = await statRemote(s, dir).catch(() => null);
+          if (st && !isDirMode(st)) {
+            throw new Error(`list_dir ${dir}: NOT_A_DIRECTORY (the path exists and is a ${isLinkMode(st) ? 'symlink' : 'file'})`);
+          }
+        }
+        throw err;
+      }
+
       const entries = list
         .filter((e) => e.filename !== '.' && e.filename !== '..')
         .map((e) => ({
@@ -613,7 +668,18 @@ function createBridge(cfg, { clientFactory = defaultClientFactory, configFile = 
           await removeTree(s, target);
           return { ok: true, removed: 'dir', recursive: true };
         }
-        await rmdirRemote(s, target);
+        // SFTP has no ENOTEMPTY status: removing a non-empty directory comes
+        // back as the generic FAILURE (4), which tells an agent nothing.
+        try {
+          await rmdirRemote(s, target);
+        } catch (err) {
+          if (err.code === 4) {
+            throw new Error(
+              `delete ${target}: DIRECTORY_NOT_EMPTY (SFTP returned FAILURE); pass recursive: true to remove the tree`
+            );
+          }
+          throw err;
+        }
         return { ok: true, removed: 'dir' };
       }
       await unlinkRemote(s, target);
@@ -654,7 +720,19 @@ function createBridge(cfg, { clientFactory = defaultClientFactory, configFile = 
       const r = await runCommand(entry.name, { command: cmd, timeoutMs: 60000 });
       // grep and ripgrep both use 0 = matches, 1 = none, 2 = error.
       if (r.exitCode === 1) return { matches: [], count: 0 };
-      if (r.exitCode !== 0) throw new Error(`search_files: ${(r.stderr || 'search failed').trim()}`);
+      if (r.exitCode === 2 || r.exitCode !== 0) {
+        // The message grep prints for a bad path is localized (zh_CN gives
+        // "没有那个文件或目录"), so it is useless to a caller matching on it.
+        // Establish the cause with a locale-independent check instead.
+        const probe = await runCommand(entry.name, {
+          command: `test -e ${shq(dir)} && echo exists || echo missing`,
+          timeoutMs: 10000,
+        });
+        if (probe.stdout.trim() === 'missing') {
+          throw new Error(`search_files: path does not exist: ${dir}`);
+        }
+        throw new Error(`search_files: search failed in ${dir} (exit ${r.exitCode})`);
+      }
       const all = r.stdout.split(/\r?\n/).filter(Boolean).map((line) => {
         const m = line.match(/^(.*?):(\d+):(.*)$/);
         return m ? { file: m[1], line: Number(m[2]), text: m[3] } : { file: null, line: null, text: line };
@@ -670,7 +748,15 @@ function createBridge(cfg, { clientFactory = defaultClientFactory, configFile = 
   function readFile(name, file) {
     return withRetry(name, () => withSftp(name, async (s) => {
       const r = await readFrom(s, file, 0);
-      if (r.error) throw new Error(`read_file ${file}: ${r.error.message}`);
+      if (r.error) {
+        // SFTP reports OPENDIR/OPEN on a directory as the generic FAILURE (4),
+        // so name the actual cause before falling back to the status code.
+        if (r.error.code === 4) {
+          const st = await statRemote(s, file).catch(() => null);
+          if (st && isDirMode(st)) throw new Error(`read_file ${file}: IS_A_DIRECTORY (use list_dir)`);
+        }
+        throw new Error(`read_file ${file}: ${describeSftpError(r.error)}`);
+      }
       // sftp.readFile pulls the whole file into memory with no bound, so a
       // prompt-injected path (say /var/log/huge.log) could OOM the server.
       // The tool is documented as small-text-files only.
@@ -688,7 +774,7 @@ function createBridge(cfg, { clientFactory = defaultClientFactory, configFile = 
     await mkdirp(sftp, dir);
     await new Promise((resolve, reject) =>
       sftp.writeFile(file, content, (e) =>
-        e ? reject(new Error(`write_file ${file}: ${e.message}`)) : resolve()
+        e ? reject(sftpError(`write_file ${file}`, e)) : resolve()
       )
     );
   }
@@ -708,7 +794,7 @@ function createBridge(cfg, { clientFactory = defaultClientFactory, configFile = 
       await mkdirp(s, path.posix.dirname(remotePath));
       await new Promise((resolve, reject) =>
         s.fastPut(local, remotePath, (e) =>
-          e ? reject(new Error(`upload: ${e.message}`)) : resolve()
+          e ? reject(sftpError('upload', e)) : resolve()
         )
       );
       return { ok: true };
@@ -771,7 +857,10 @@ function createBridge(cfg, { clientFactory = defaultClientFactory, configFile = 
         throw new Error('start_background failed: could not read process pid');
       }
       tasks.set(taskId, { hostName: entry.name, pid, scriptFile, outFile, pidFile, offset: 0 });
-      return { taskId, pid };
+      // The consumers (background_logs / stop_background) take `task_id`, and so
+      // does the README. Returning camelCase here made an agent that copied the
+      // key straight back fail MCP input validation.
+      return { task_id: taskId, taskId, pid };
     });
   }
 
@@ -890,6 +979,8 @@ module.exports = {
   removeTree,
   isDirMode,
   isLinkMode,
+  describeSftpError,
+  SFTP_STATUS,
   connectAlgorithms,
   downloadLimit,
   SHA1_REMOVALS,

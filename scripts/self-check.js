@@ -17,12 +17,14 @@ const hostkeys = require(path.join(ROOT, 'src', 'hostkeys.js'));
 const paths = require(path.join(ROOT, 'src', 'paths.js'));
 const {
   createBridge,
+  readdirRemote,
   readFrom,
   readBinary,
   statRemote,
   connectAlgorithms,
   downloadLimit,
   makeExecCommand,
+  describeSftpError,
   SHA1_REMOVALS,
   DEFAULT_MAX_DOWNLOAD,
   MAX_OUTPUT,
@@ -135,6 +137,16 @@ function sftpOnly(sftp) {
     end() {},
     sftp(cb) { cb(null, sftp); },
   });
+}
+
+// Just enough SFTP for start_background: write the script, then let the exec
+// stub return a pid.
+function sftpForTask() {
+  return {
+    writeFile: (f, c, cb) => cb(null),
+    mkdir: (d, cb) => cb(null),
+    stat: (d, cb) => cb(Object.assign(new Error('no'), { code: 2 })),
+  };
 }
 
 const rootsDir = path.join(tmp, 'allowed');
@@ -728,6 +740,148 @@ async function main() {
     const r = await b.searchFiles('dev01', { pattern: 'x', path: '/', maxResults: 5 });
     assert.strictEqual(r.matches.length, 5);
     assert.strictEqual(r.truncated, true);
+  });
+
+  section('SFTP error messages are actionable (#4)');
+  check('numeric status codes map to names, not "Failure"', () => {
+    assert.strictEqual(describeSftpError({ code: 2, message: 'No such file' }), 'NO_SUCH_FILE (No such file)');
+    assert.strictEqual(describeSftpError({ code: 3, message: 'Permission denied' }), 'PERMISSION_DENIED (Permission denied)');
+    assert.strictEqual(describeSftpError({ code: 4, message: 'Failure' }), 'FAILURE (Failure)');
+    assert.strictEqual(describeSftpError({ code: 8, message: 'Operation unsupported' }), 'OP_UNSUPPORTED (Operation unsupported)');
+  });
+  check('a bare status with no message still names the code', () => {
+    assert.strictEqual(describeSftpError({ code: 4 }), 'FAILURE');
+  });
+  check('an error without a code passes its message through', () => {
+    assert.strictEqual(describeSftpError(new Error('boom')), 'boom');
+    assert.strictEqual(describeSftpError(null), 'unknown error');
+  });
+
+  section('background task id key (#3)');
+  await checkAsync('start_background returns both task_id and taskId', async () => {
+    const bridge = createBridge(BASE_CFG, {
+      clientFactory: () => ({
+        on(ev, fn) { (this.h = this.h || {})[ev] = fn; return this; },
+        connect() { setImmediate(() => this.h.ready()); },
+        end() {},
+        sftp(cb) { cb(null, sftpForTask()); },
+        exec(cmd, opts, cb) {
+          const { EventEmitter } = require('events');
+          const ch = new EventEmitter();
+          ch.stdin = { write: (d, f) => f && f(), end() {} };
+          ch.stderr = new EventEmitter();
+          cb(null, ch);
+          // First exec launches the job, second reads the pid file.
+          const out = /cat /.test(cmd) ? '4242\n' : '';
+          setImmediate(() => {
+            if (out) ch.emit('data', Buffer.from(out));
+            ch.emit('exit', 0);
+            ch.emit('close', 0);
+          });
+          return ch;
+        },
+      }),
+      configFile,
+    });
+    const r = await bridge.startBackground('dev01', { command: 'sleep 1', cwd: '/tmp' });
+    assert.ok(/^[0-9a-f]+$/.test(r.task_id), 'task_id must be present');
+    assert.strictEqual(r.taskId, r.task_id, 'taskId kept for compatibility');
+    assert.ok(/^\d+$/.test(r.pid));
+  });
+
+  section('error codes survive the wrappers (#4)');
+  await checkAsync('readdirRemote keeps the numeric code on the thrown error', async () => {
+    const sftp = { readdir: (d, cb) => cb(Object.assign(new Error('No such file'), { code: 2 })) };
+    await assert.rejects(() => readdirRemote(sftp, '/x'), (err) => {
+      assert.strictEqual(err.code, 2, 'code must survive, callers branch on it');
+      assert.ok(/NO_SUCH_FILE/.test(err.message), err.message);
+      return true;
+    });
+  });
+  await checkAsync('list_dir on a file says NOT_A_DIRECTORY, not "No such file"', async () => {
+    const sftp = {
+      readdir: (d, cb) => cb(Object.assign(new Error('No such file'), { code: 2 })),
+      stat: (d, cb) => cb(null, { mode: 0o100644 }),
+    };
+    await assert.rejects(() => bridgeWith(sftpOnly(sftp)).listDir('dev01', '/etc/hostname'), /NOT_A_DIRECTORY/);
+  });
+  await checkAsync('list_dir on a genuinely missing path still says NO_SUCH_FILE', async () => {
+    const sftp = {
+      readdir: (d, cb) => cb(Object.assign(new Error('No such file'), { code: 2 })),
+      stat: (d, cb) => cb(Object.assign(new Error('No such file'), { code: 2 })),
+    };
+    await assert.rejects(() => bridgeWith(sftpOnly(sftp)).listDir('dev01', '/nope'), /NO_SUCH_FILE/);
+  });
+  await checkAsync('read_file on a directory says IS_A_DIRECTORY', async () => {
+    const sftp = {
+      open: (f, fl, cb) => cb(Object.assign(new Error('Failure'), { code: 4 })),
+      stat: (f, cb) => cb(null, { mode: 0o040755 }),
+    };
+    await assert.rejects(() => bridgeWith(sftpOnly(sftp)).readFile('dev01', '/tmp'), /IS_A_DIRECTORY/);
+  });
+  await checkAsync('delete of a non-empty dir suggests recursive', async () => {
+    const sftp = {
+      stat: (f, cb) => cb(null, { mode: 0o040755 }),
+      rmdir: (d, cb) => cb(Object.assign(new Error('Failure'), { code: 4 })),
+    };
+    await assert.rejects(() => bridgeWith(sftpOnly(sftp)).deletePath('dev01', '/tmp/x'), /DIRECTORY_NOT_EMPTY.*recursive/);
+  });
+
+  section('search_files error reporting (#5)');
+  await checkAsync('a missing path is a tool error, not an empty result', async () => {
+    const b = createBridge(BASE_CFG, {
+      clientFactory: () => ({
+        on(ev, fn) { (this.h = this.h || {})[ev] = fn; return this; },
+        connect() { setImmediate(() => this.h.ready()); },
+        end() {},
+        exec(cmd, opts, cb) {
+          const { EventEmitter } = require('events');
+          const ch = new EventEmitter();
+          ch.stdin = { write: (d, f) => f && f(), end() {} };
+          ch.stderr = new EventEmitter();
+          cb(null, ch);
+          const isProbe = /test -e/.test(cmd);
+          setImmediate(() => {
+            if (isProbe) ch.emit('data', Buffer.from('missing\n'));
+            ch.emit('exit', 2);
+            ch.emit('close', 2);
+          });
+          return ch;
+        },
+      }),
+      configFile,
+    });
+    await assert.rejects(() => b.searchFiles('dev01', { pattern: 'x', path: '/nonexistent' }), /path does not exist/);
+  });
+  await checkAsync('the localized grep message never reaches the caller', async () => {
+    const b = createBridge(BASE_CFG, {
+      clientFactory: () => ({
+        on(ev, fn) { (this.h = this.h || {})[ev] = fn; return this; },
+        connect() { setImmediate(() => this.h.ready()); },
+        end() {},
+        exec(cmd, opts, cb) {
+          const { EventEmitter } = require('events');
+          const ch = new EventEmitter();
+          ch.stdin = { write: (d, f) => f && f(), end() {} };
+          ch.stderr = new EventEmitter();
+          cb(null, ch);
+          const isProbe = /test -e/.test(cmd);
+          setImmediate(() => {
+            if (isProbe) ch.emit('data', Buffer.from('missing\n'));
+            // Simulate a zh_CN host.
+            else ch.stderr.emit('data', Buffer.from('grep: /nonexistent: 没有那个文件或目录\n'));
+            ch.emit('exit', 2);
+            ch.emit('close', 2);
+          });
+          return ch;
+        },
+      }),
+      configFile,
+    });
+    await assert.rejects(() => b.searchFiles('dev01', { pattern: 'x', path: '/nonexistent' }), (err) => {
+      assert.ok(!/没有那个文件/.test(err.message), `localized text leaked: ${err.message}`);
+      return true;
+    });
   });
 
   fs.rmSync(tmp, { recursive: true, force: true });

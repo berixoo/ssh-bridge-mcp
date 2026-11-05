@@ -188,16 +188,22 @@ server.registerTool('start_background', {
 
 server.registerTool('background_logs', {
   description: 'Read new log output since the last call for a background task. Returns { content, running, truncated }. truncated:true means more output is already waiting -- call again to get it.',
-  inputSchema: { task_id: z.string().min(1) },
+  // taskId is accepted as an alias: start_background used to return camelCase,
+  // so a model that copied that key back should not get a validation error.
+  inputSchema: { task_id: z.string().min(1).optional(), taskId: z.string().min(1).optional() },
 }, async (args) => {
-  try { return ok(await bridge.backgroundLogs(args.task_id)); } catch (e) { throw toolError(e); }
+  const id = args.task_id || args.taskId;
+  if (!id) throw new Error('background_logs requires task_id (returned by start_background)');
+  try { return ok(await bridge.backgroundLogs(id)); } catch (e) { throw toolError(e); }
 });
 
 server.registerTool('stop_background', {
   description: 'Kill a background task started with start_background.',
-  inputSchema: { task_id: z.string().min(1) },
+  inputSchema: { task_id: z.string().min(1).optional(), taskId: z.string().min(1).optional() },
 }, async (args) => {
-  try { return ok(await bridge.stopBackground(args.task_id)); } catch (e) { throw toolError(e); }
+  const id = args.task_id || args.taskId;
+  if (!id) throw new Error('stop_background requires task_id (returned by start_background)');
+  try { return ok(await bridge.stopBackground(id)); } catch (e) { throw toolError(e); }
 });
 
 const transport = new StdioServerTransport();
