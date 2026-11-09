@@ -252,10 +252,23 @@ function readBinary(sftp, file) {
           return done(() => reject(new Error(`read ${file}: ${st.size} bytes exceeds the binary read limit`)));
         }
         const buf = Buffer.alloc(Math.max(1, st.size));
-        sftp.read(h, buf, 0, buf.length, 0, (e3, bytes) => {
-          if (e3) return done(() => reject(sftpError(`read ${file}`, e3)));
-          done(() => resolve(buf.subarray(0, bytes)));
-        });
+        // A single SFTP read returns at most one packet (~64 KiB) and reports
+        // that short count as success, so a larger file came back silently
+        // truncated -- screenshots past 64 KiB lost their JPEG EOI marker.
+        // Loop until the declared size is filled.
+        const CHUNK = 32768;
+        let off = 0;
+        const pump = () => {
+          if (off >= st.size) return done(() => resolve(buf.subarray(0, off)));
+          const len = Math.min(CHUNK, st.size - off);
+          sftp.read(h, buf, off, len, off, (e3, bytes) => {
+            if (e3) return done(() => reject(sftpError(`read ${file}`, e3)));
+            if (!bytes) return done(() => resolve(buf.subarray(0, off)));
+            off += bytes;
+            pump();
+          });
+        };
+        pump();
       });
     });
   });
@@ -889,10 +902,13 @@ function createBridge(cfg, { clientFactory = defaultClientFactory, configFile = 
     const remotePath = `/tmp/ssh-bridge-shot-${crypto.randomBytes(6).toString('hex')}.png`;
     const optimizedPath = remotePath.replace(/\.png$/, '.jpg');
     return withRetry(entry.name, async () => {
-      // The capture script runs through bash -c with the output path as $1, so
-      // no path ever gets interpolated into shell text.
+      // The capture script goes in over stdin (`bash -s`) rather than as a
+      // `bash -c` argument: the script contains single quotes, and quoting it
+      // into a shell word leaves bash parsing the inner quotes, which shifts
+      // $0/$1 and silently loses the session detection. Paths stay arguments.
       const r = await runCommand(entry.name, {
-        command: `bash -c ${shq(buildCaptureScript())} ssh-bridge-capture ${shq(remotePath)}`,
+        command: `bash -s ${shq(remotePath)}`,
+        input: buildCaptureScript(),
         timeoutMs: 90000,
       });
       const result = parseCaptureResult(r.stdout);
@@ -905,7 +921,8 @@ function createBridge(cfg, { clientFactory = defaultClientFactory, configFile = 
         // same frame at 1600px/quality 82 is ~30 KB.
         if (maxWidth > 0) {
           const o = await runCommand(entry.name, {
-            command: `bash -c ${shq(buildOptimizeScript())} ssh-bridge-optimize ${shq(remotePath)} ${shq(optimizedPath)} ${shq(String(maxWidth))} ${shq(String(quality))}`,
+            command: `bash -s ${shq(remotePath)} ${shq(optimizedPath)} ${shq(String(maxWidth))} ${shq(String(quality))}`,
+            input: buildOptimizeScript(),
             timeoutMs: 30000,
           });
           if (String(o.stdout).includes('OPTIMIZED')) readPath = optimizedPath;
