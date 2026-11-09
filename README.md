@@ -104,7 +104,15 @@ claude mcp add ssh-bridge -- node <path-to>/ssh-bridge-mcp/src/server.js
 - **TCP_NODELAY**：ssh2 自建 socket 且不关 Nagle，Windows 上 Nagle + 延迟 ACK 让每次小往返卡 ~170 ms。现在自己建 socket 并 `setNoDelay(true)`，实测 40 次 `list_dir` 从 6810 ms 降到 **59 ms**。
 - **SFTP 会话复用**：每个 host 缓存一条 SFTP 会话（原来是每次调用新建），失败时丢弃并重建一次。20 个并发 `write_file` 只需 50 ms。
 - **TCP keepalive**：空闲连接每 30 s 探活，避免跨 agent 轮次被 NAT 掐断。
+- **并发闸门**：sshd 的 `MaxSessions`（默认 10）限制单连接并发通道数，**超了会重置整条连接**——一次并发突发会让所有调用一起失败。现在通道开启用信号量限流（默认 8，可用 `maxConcurrentChannels` 调整），只串行化通道建立，命令仍并行。实测 12/20/30/50 并发各 3 轮全部 100% 成功；修复前 20 并发是 0/20 且连接被 `ECONNRESET`。
+- **重试退避**：通道类错误（含 ssh2 的 `Not connected`、`Unable to exec`、`No response from server`）会丢弃连接并以 100/200/400 ms 退避重建，最多 3 次。
 - **`pipefail`**（可选）：`cat /etc/shadow | head -1` 默认会以 0 退出，把权限错误报成成功；传 `pipefail: true` 可让管道任一段失败即失败。默认关，因为会改变 `cmd | head` 的正常行为。
+
+### 已知语义限制
+
+- **`read_file` 读 `/proc`、`/sys` 里的伪文件**：SFTP 子系统是独立进程，`/proc/self/*` 读到的是 `sftp-server` 自己，不是你的 shell。`fstat` 对这类文件报 `size=0`，现在会实际读一次直到 EOF（以前直接返回空），但内容归属仍是 sftp-server。要看 shell 自己的 `/proc/self/*` 请用 `run_command`。
+- **`delete` 符号链接**：用 `lstat` 判断，链接只解除、绝不跟随。删指向目录的链接返回 `removed: "link"`，目标目录不受影响。
+
 
 
 ## 安全边界

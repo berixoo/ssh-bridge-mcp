@@ -839,10 +839,22 @@ async function main() {
   });
   await checkAsync('delete of a non-empty dir suggests recursive', async () => {
     const sftp = {
-      stat: (f, cb) => cb(null, { mode: 0o040755 }),
+      lstat: (f, cb) => cb(null, { mode: 0o040755 }),
       rmdir: (d, cb) => cb(Object.assign(new Error('Failure'), { code: 4 })),
     };
     await assert.rejects(() => bridgeWith(sftpOnly(sftp)).deletePath('dev01', '/tmp/x'), /DIRECTORY_NOT_EMPTY.*recursive/);
+  });
+  await checkAsync('delete unlinks a symlink instead of touching its target', async () => {
+    // lstat reports a link; stat would have reported the target directory and
+    // sent the call down the rmdir path, failing with "No such file".
+    const sftp = {
+      lstat: (f, cb) => cb(null, { mode: 0o120777 }),
+      unlink: (f, cb) => { sftp.unlinked = f; cb(null); },
+      rmdir: () => { throw new Error('must not rmdir a symlink target'); },
+    };
+    const r = await bridgeWith(sftpOnly(sftp)).deletePath('dev01', '/tmp/link-dir');
+    assert.strictEqual(r.removed, 'link');
+    assert.strictEqual(sftp.unlinked, '/tmp/link-dir');
   });
 
   section('search_files error reporting (#5)');
@@ -900,6 +912,59 @@ async function main() {
       assert.ok(!/没有那个文件/.test(err.message), `localized text leaked: ${err.message}`);
       return true;
     });
+  });
+
+  section('channel concurrency (sshd MaxSessions)');
+  await checkAsync('channel opens never exceed maxConcurrentChannels', async () => {
+    let inFlight = 0;
+    let peak = 0;
+    const b = createBridge({ ...BASE_CFG, maxConcurrentChannels: 3 }, {
+      clientFactory: () => ({
+        on(ev, fn) { (this.h = this.h || {})[ev] = fn; return this; },
+        connect() { setImmediate(() => this.h.ready()); },
+        end() {},
+        exec(cmd, opts, cb) {
+          inFlight++;
+          peak = Math.max(peak, inFlight);
+          const { EventEmitter } = require('events');
+          const ch = new EventEmitter();
+          ch.stdin = { write: (d, f) => f && f(), end() {} };
+          ch.stderr = new EventEmitter();
+          cb(null, ch);
+          setTimeout(() => {
+            inFlight--;
+            ch.emit('exit', 0);
+            ch.emit('close', 0);
+          }, 5);
+          return ch;
+        },
+      }),
+      configFile,
+    });
+    await Promise.all(Array.from({ length: 12 }, () => b.runCommand('dev01', { command: 'true' })));
+    assert.ok(peak <= 3, `opened ${peak} channels at once, cap was 3`);
+    assert.strictEqual(inFlight, 0, 'every channel slot must be released');
+  });
+  await checkAsync('a burst still completes every call', async () => {
+    const b = createBridge({ ...BASE_CFG, maxConcurrentChannels: 2 }, {
+      clientFactory: () => ({
+        on(ev, fn) { (this.h = this.h || {})[ev] = fn; return this; },
+        connect() { setImmediate(() => this.h.ready()); },
+        end() {},
+        exec(cmd, opts, cb) {
+          const { EventEmitter } = require('events');
+          const ch = new EventEmitter();
+          ch.stdin = { write: (d, f) => f && f(), end() {} };
+          ch.stderr = new EventEmitter();
+          cb(null, ch);
+          setImmediate(() => { ch.emit('exit', 0); ch.emit('close', 0); });
+          return ch;
+        },
+      }),
+      configFile,
+    });
+    const rs = await Promise.all(Array.from({ length: 20 }, (_, i) => b.runCommand('dev01', { command: `echo ${i}` })));
+    assert.strictEqual(rs.length, 20);
   });
 
   fs.rmSync(tmp, { recursive: true, force: true });

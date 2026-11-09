@@ -160,16 +160,19 @@ function readFrom(sftp, file, offset) {
         // from the beginning instead of permanently skipping the new data.
         const start = st.size < offset ? 0 : offset;
         const available = st.size - start;
-        if (available <= 0) return done({ content: '', size: st.size, truncated: false, error: null });
-        // Cap the per-call read. Buffer.alloc(available) lets a runaway
-        // producer -- or an fstat that simply lies -- allocate unbounded memory
-        // in the server process.
-        const n = Math.min(available, MAX_OUTPUT);
+        // size === 0 is ambiguous: it is an empty file, but it is also what
+        // /proc and /sys report for streams that do have content. Read once to
+        // find out instead of assuming empty -- a read past the end just comes
+        // back with 0 bytes.
+        const n = available > 0 ? Math.min(available, MAX_OUTPUT) : MAX_OUTPUT;
         const buf = Buffer.alloc(n);
         sftp.read(h, buf, 0, n, start, (e3, bytes) => {
-          if (e3) return done({ content: '', size: offset, truncated: false, error: e3 });
+          // EOF on a stream is a normal end, not an error.
+          if (e3 && !(e3.code === 1 || /end of file/i.test(e3.message || ''))) {
+            return done({ content: '', size: offset, truncated: false, error: e3 });
+          }
           // A non-numeric byte count would poison the caller's offset with NaN.
-          const got = Number.isFinite(bytes) ? Math.min(bytes, n) : 0;
+          const got = !e3 && Number.isFinite(bytes) ? Math.min(bytes, n) : 0;
           done({
             content: buf.subarray(0, got).toString('utf8'),
             size: start + got,
@@ -196,6 +199,15 @@ function sftpError(prefix, err) {
 function statRemote(sftp, file) {
   return new Promise((resolve, reject) =>
     sftp.stat(file, (e, st) => (e ? reject(sftpError(`stat ${file}`, e)) : resolve(st)))
+  );
+}
+
+// lstat does not follow symlinks, which is what deletion needs: stat() on a
+// symlink to a directory reports a directory, so the caller would try rmdir
+// and get "No such file" instead of unlinking the link.
+function lstatRemote(sftp, file) {
+  return new Promise((resolve, reject) =>
+    sftp.lstat(file, (e, st) => (e ? reject(sftpError(`stat ${file}`, e)) : resolve(st)))
   );
 }
 
@@ -359,12 +371,41 @@ function createBridge(cfg, { clientFactory = defaultClientFactory, configFile = 
   const tasks = new Map();
   const hostKeys = createKnownHostsStore(knownHostsPaths(cfg, configFile));
 
+  // sshd counts concurrent channels per connection (MaxSessions, 10 by default)
+  // and resets the whole connection when it is exceeded -- one burst of parallel
+  // tool calls could take the bridge down for every caller, not just the ones
+  // over the line. A semaphore keeps us under the cap. Only the channel setup is
+  // serialised; commands still run concurrently.
+  const MAX_CHANNELS = cfg.maxConcurrentChannels || 8;
+  let freeSlots = MAX_CHANNELS;
+  const channelWaiters = [];
+  function acquireChannel() {
+    if (freeSlots > 0) {
+      freeSlots--;
+      return Promise.resolve();
+    }
+    return new Promise((resolve) => channelWaiters.push(resolve));
+  }
+  function releaseChannel() {
+    const next = channelWaiters.shift();
+    // The waiter inherits the slot that was just freed; do not touch freeSlots.
+    if (next) next();
+    else freeSlots++;
+  }
+
   // A wedged connection (channels exhausted by a background job or a past leak)
   // only recovers by dropping the TCP connection so the server frees every
-  // session. dispose() closes it and drops it from the pool; isChannelFailure
-  // matches ssh2's exact message; withRetry rebuilds once on a fresh conn.
+  // session. dispose() closes it and drops it from the pool; withRetry rebuilds
+  // once on a fresh conn.
+  //
+  // sshd caps concurrent channels per connection (MaxSessions, 10 by default).
+  // Going past it does not produce one tidy error: the same condition has been
+  // observed as an explicit channel-open failure, a bare "Unable to exec", a
+  // channel that closes mid-command, and a server that simply stops answering.
+  // All of them mean "reconnect", so all of them are matched here.
   function isChannelFailure(err) {
-    return /channel open|open failed/i.test((err && err.message) || '');
+    const m = (err && err.message) || '';
+    return /channel open|open failed|unable to exec|no response from server|connection closed before command completed|session closed|not connected/i.test(m);
   }
   function dispose(name) {
     dropSftp(name);
@@ -374,13 +415,21 @@ function createBridge(cfg, { clientFactory = defaultClientFactory, configFile = 
     p.then((c) => { try { c.end(); } catch (_) {} }).catch(() => {});
   }
   async function withRetry(name, fn) {
-    try {
-      return await fn();
-    } catch (err) {
-      if (!isChannelFailure(err)) throw err;
-      dispose(name);
-      return await fn();
+    // Channel exhaustion is transient: the server frees the sessions when the
+    // connection drops. One immediate rebuild is not always enough under a
+    // burst, so back off and try a few times before surfacing the error.
+    let lastErr;
+    for (let attempt = 0; attempt < 3; attempt++) {
+      try {
+        return await fn();
+      } catch (err) {
+        if (!isChannelFailure(err)) throw err;
+        lastErr = err;
+        dispose(name);
+        await new Promise((r) => setTimeout(r, 100 * 2 ** attempt));
+      }
     }
+    throw lastErr;
   }
 
   function getConn(name) {
@@ -452,8 +501,15 @@ function createBridge(cfg, { clientFactory = defaultClientFactory, configFile = 
   async function getSftp(name) {
     if (sftps.has(name)) return sftps.get(name);
     const client = await getConn(name);
+    // Opening an SFTP session is a channel open too, so it waits for a slot --
+    // but only while being created: the session is cached and long-lived, so
+    // holding the slot afterwards would starve every exec call.
+    await acquireChannel();
     const p = new Promise((resolve, reject) =>
-      client.sftp((e, s) => (e ? reject(e) : resolve(s)))
+      client.sftp((e, s) => {
+        releaseChannel();
+        return e ? reject(e) : resolve(s);
+      })
     );
     sftps.set(name, p);
     p.catch(() => { if (sftps.get(name) === p) sftps.delete(name); });
@@ -504,7 +560,12 @@ function createBridge(cfg, { clientFactory = defaultClientFactory, configFile = 
     if (pty) opts.pty = { rows: 40, cols: 200, term: 'xterm-256color' };
     const timeout = timeoutMs || 30000;
     return new Promise((resolve, reject) => {
+      // The slot is held from just before the channel opens until the command
+      // finishes, on every exit path.
+      let slotHeld = false;
+      const releaseSlot = () => { if (slotHeld) { slotHeld = false; releaseChannel(); } };
       const finish = (res) => {
+        releaseSlot();
         if (res) {
           let out = res.stdout;
           let errOut = res.stderr;
@@ -528,105 +589,124 @@ function createBridge(cfg, { clientFactory = defaultClientFactory, configFile = 
           reject(new Error('connection closed before command completed'));
         }
       };
-      client.exec(full, opts, (err, ch) => {
-        if (err) return reject(new Error(`exec failed: ${err.message}`));
-        let stdout = '';
-        let stderr = '';
-        let stdoutTruncated = false;
-        let stderrTruncated = false;
-        let exitCode = null;
-        let timedOut = false;
-        let done = false;
-        let bgGrace = null;
-        // Bound accumulation now so runaway output (e.g. `yes`) cannot grow
-        // stdout/stderr without limit and OOM the server before capping.
-        const append = (cur, chunk, markTruncated) => {
-          if (cur.length >= MAX_OUTPUT) { markTruncated(); return cur; }
-          if (cur.length + chunk.length > MAX_OUTPUT) {
-            markTruncated();
-            return cur + chunk.slice(0, MAX_OUTPUT - cur.length);
-          }
-          return cur + chunk;
-        };
-        const timer = setTimeout(() => {
-          timedOut = true;
-          done = true;
-          if (pidFile) {
-            killProcessGroup(client, pidFile).then(() => {
-              clearTimeout(timer);
-              finish({ exitCode, stdout, stderr, timedOut });
-            });
-          } else {
-            ch.signal('SIGKILL', () => {
-              clearTimeout(timer);
-              finish({ exitCode, stdout, stderr, timedOut });
-            });
-          }
-        }, timeout);
-        ch.on('error', () => {
-          if (done) return;
-          done = true;
-          clearTimeout(timer);
-          if (bgGrace) clearTimeout(bgGrace);
-          finish(null);
-        });
-        // Write stdin immediately after the channel is created, NOT on the
-        // 'ready' event. ssh2 exec channels accept buffered writes before the
-        // open confirmation and flush them once it arrives; the flush callback
-        // then closes stdin (EOF). Writing + ending synchronously on 'ready'
-        // can drop the buffered data, stranding `cat`/`read`/`sudo -S` on
-        // empty stdin. Verified against real OpenSSH.
-        if (sudo && sudoPassword) {
-          ch.stdin.write(sudoPassword + '\n', () => {
-            if (input) ch.stdin.write(input, () => ch.stdin.end());
-            else ch.stdin.end();
-          });
-        } else if (input) {
-          ch.stdin.write(input, () => ch.stdin.end());
-        } else {
-          ch.stdin.end();
+      // Acquire a channel slot first: sshd's MaxSessions (10 by default) counts
+      // concurrent channels per connection, and exceeding it resets the whole
+      // connection rather than failing one call.
+      acquireChannel().then(() => {
+        slotHeld = true;
+        // client.exec throws synchronously when the connection is already gone
+        // ("Not connected"), so it cannot be left to the callback.
+        try {
+          client.exec(full, opts, onChannel);
+        } catch (e) {
+          releaseSlot();
+          reject(e);
         }
-        ch.on('exit', (code) => {
-          exitCode = code;
-          // The foreground process is done. If a background job (`nohup ... &`)
-          // still holds the channel's stdio open, 'close' never arrives and the
-          // tool would block until it times out. Start a short countdown so we
-          // finish as a normal result (NOT a timeout, nothing is killed) when
-          // the channel is only being held by a detached child.
-          if (bgGrace == null) {
-            bgGrace = setTimeout(() => {
-              if (done) return;
-              done = true;
-              clearTimeout(timer);
-              finish({ exitCode, stdout, stderr, timedOut: false, truncated: stdoutTruncated || stderrTruncated });
-            }, BG_GRACE_MS);
+        function onChannel(err, ch) {
+          if (err) {
+            releaseSlot();
+            return reject(new Error(`exec failed: ${err.message}`));
           }
-        });
-        ch.on('data', (d) => { stdout = append(stdout, d.toString(), () => { stdoutTruncated = true; }); });
-        ch.stderr.on('data', (d) => { stderr = append(stderr, d.toString(), () => { stderrTruncated = true; }); });
-        ch.on('close', (code) => {
-          if (done) return;
-          done = true;
-          clearTimeout(timer);
-          if (bgGrace) clearTimeout(bgGrace);
-          if (exitCode == null) exitCode = code;
-          // A close without an exit code and without a timeout means the
-          // connection died mid-command; that is a failure, not a success
-          // with a null exit code. `== null` also covers code === undefined.
-          if (exitCode == null && !timedOut) return finish(null);
-          finish({ exitCode, stdout, stderr, timedOut, truncated: stdoutTruncated || stderrTruncated });
-        });
-      });
+          let stdout = '';
+          let stderr = '';
+          let stdoutTruncated = false;
+          let stderrTruncated = false;
+          let exitCode = null;
+          let timedOut = false;
+          let done = false;
+          let bgGrace = null;
+          // Bound accumulation now so runaway output (e.g. `yes`) cannot grow
+          // stdout/stderr without limit and OOM the server before capping.
+          const append = (cur, chunk, markTruncated) => {
+            if (cur.length >= MAX_OUTPUT) { markTruncated(); return cur; }
+            if (cur.length + chunk.length > MAX_OUTPUT) {
+              markTruncated();
+              return cur + chunk.slice(0, MAX_OUTPUT - cur.length);
+            }
+            return cur + chunk;
+          };
+          const timer = setTimeout(() => {
+            timedOut = true;
+            done = true;
+            if (pidFile) {
+              killProcessGroup(client, pidFile).then(() => {
+                clearTimeout(timer);
+                finish({ exitCode, stdout, stderr, timedOut });
+              });
+            } else {
+              ch.signal('SIGKILL', () => {
+                clearTimeout(timer);
+                finish({ exitCode, stdout, stderr, timedOut });
+              });
+            }
+          }, timeout);
+          ch.on('error', () => {
+            if (done) return;
+            done = true;
+            clearTimeout(timer);
+            if (bgGrace) clearTimeout(bgGrace);
+            finish(null);
+          });
+          // Write stdin immediately after the channel is created, NOT on the
+          // 'ready' event. ssh2 exec channels accept buffered writes before the
+          // open confirmation and flush them once it arrives; the flush callback
+          // then closes stdin (EOF). Writing + ending synchronously on 'ready'
+          // can drop the buffered data, stranding `cat`/`read`/`sudo -S` on
+          // empty stdin. Verified against real OpenSSH.
+          if (sudo && sudoPassword) {
+            ch.stdin.write(sudoPassword + '\n', () => {
+              if (input) ch.stdin.write(input, () => ch.stdin.end());
+              else ch.stdin.end();
+            });
+          } else if (input) {
+            ch.stdin.write(input, () => ch.stdin.end());
+          } else {
+            ch.stdin.end();
+          }
+          ch.on('exit', (code) => {
+            exitCode = code;
+            // The foreground process is done. If a background job (`nohup ... &`)
+            // still holds the channel's stdio open, 'close' never arrives and the
+            // tool would block until it times out. Start a short countdown so we
+            // finish as a normal result (NOT a timeout, nothing is killed) when
+            // the channel is only being held by a detached child.
+            if (bgGrace == null) {
+              bgGrace = setTimeout(() => {
+                if (done) return;
+                done = true;
+                clearTimeout(timer);
+                finish({ exitCode, stdout, stderr, timedOut: false, truncated: stdoutTruncated || stderrTruncated });
+              }, BG_GRACE_MS);
+            }
+          });
+          ch.on('data', (d) => { stdout = append(stdout, d.toString(), () => { stdoutTruncated = true; }); });
+          ch.stderr.on('data', (d) => { stderr = append(stderr, d.toString(), () => { stderrTruncated = true; }); });
+          ch.on('close', (code) => {
+            if (done) return;
+            done = true;
+            clearTimeout(timer);
+            if (bgGrace) clearTimeout(bgGrace);
+            if (exitCode == null) exitCode = code;
+            // A close without an exit code and without a timeout means the
+            // connection died mid-command; that is a failure, not a success
+            // with a null exit code. `== null` also covers code === undefined.
+            if (exitCode == null && !timedOut) return finish(null);
+            finish({ exitCode, stdout, stderr, timedOut, truncated: stdoutTruncated || stderrTruncated });
+          });
+        }
+      }, reject);
     });
   }
 
   function runCommand(name, args) {
     const entry = resolveHost(cfg, name);
-    return withRetry(entry.name, () =>
-      getConn(entry.name).then((client) =>
-        execChannel(client, { ...args, sudoPassword: entry.sudoPassword })
-      )
-    );
+    // Resolve the connection *after* the slot is granted: waiting on the
+    // semaphore can outlive the connection it was queued behind, and using a
+    // disposed client fails with "Not connected" instead of retrying.
+    return withRetry(entry.name, async () => {
+      const client = await getConn(entry.name);
+      return execChannel(client, { ...args, sudoPassword: entry.sudoPassword });
+    });
   }
 
   function listHosts() {
@@ -675,7 +755,13 @@ function createBridge(cfg, { clientFactory = defaultClientFactory, configFile = 
   // non-empty directory is never removed implicitly.
   async function deletePath(name, target, { recursive = false } = {}) {
     return withRetry(name, () => withSftp(name, async (s) => {
-      const st = await statRemote(s, target);
+      // lstat, not stat: a symlink must be unlinked as a link, never resolved.
+      // Resolving it would rmdir the *target* directory.
+      const st = await lstatRemote(s, target);
+      if (isLinkMode(st)) {
+        await unlinkRemote(s, target);
+        return { ok: true, removed: 'link' };
+      }
       if (isDirMode(st)) {
         if (recursive) {
           await removeTree(s, target);
