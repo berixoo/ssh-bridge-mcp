@@ -90,7 +90,7 @@ function knownHostsStore(lines) {
 }
 const HOST = { host: 'dev01', port: 22, label: 'dev01' };
 
-function fakeSftp(source, { reportedSize, readError, fstatError } = {}) {
+function fakeSftp(source, { reportedSize, readError, fstatError, maxChunk } = {}) {
   const state = { opens: 0, closes: 0 };
   return {
     state,
@@ -101,7 +101,10 @@ function fakeSftp(source, { reportedSize, readError, fstatError } = {}) {
     },
     read(handle, buf, offset, length, position, cb) {
       if (readError) return cb(readError);
-      const chunk = source.subarray(position, position + length);
+      // maxChunk models the SFTP packet ceiling: a single read returns at most
+      // this many bytes however much was asked for.
+      const want = maxChunk === undefined ? length : Math.min(length, maxChunk);
+      const chunk = source.subarray(position, position + want);
       chunk.copy(buf, offset);
       cb(null, chunk.length);
     },
@@ -608,6 +611,11 @@ async function main() {
     assert.strictEqual(NO_SESSION, 3);
     assert.ok(buildCaptureScript().includes('exit 3'), 'script must exit 3 for no session');
   });
+  check('capture script survives systemd < 230 and an unset XDG_SESSION_TYPE', () => {
+    const s = buildCaptureScript();
+    assert.ok(!/^set -u$/m.test(s), 'set -u kills the script on Ubuntu 16.04, where XDG_SESSION_TYPE is unset');
+    assert.ok(s.includes('show_prop'), 'session properties need a prefix-stripping fallback for loginctl --value');
+  });
   check('parses a successful capture', () => {
     const r = parseCaptureResult('noise\nRESULT|ok|gnome-screenshot-xwayland|wayland|\n');
     assert.strictEqual(r.ok, true);
@@ -672,6 +680,16 @@ async function main() {
   await checkAsync('refuses an oversized binary read', async () => {
     const sftp = fakeSftp(Buffer.alloc(16), { reportedSize: MAX_OUTPUT * 4 + 1 });
     await assert.rejects(() => readBinary(sftp, '/huge.png'), /exceeds the binary read limit/);
+  });
+  await checkAsync('reassembles a file larger than one SFTP packet', async () => {
+    // Screenshots are routinely >64 KiB; one read returns one packet and
+    // reports the short count as success, which used to end the transfer early
+    // and strip the JPEG EOI marker.
+    const big = Buffer.alloc(200 * 1024);
+    for (let i = 0; i < big.length; i++) big[i] = i & 0xff;
+    const got = await readBinary(fakeSftp(big, { maxChunk: 32768 }), '/big.png');
+    assert.strictEqual(got.length, big.length, 'a short read must not end the transfer early');
+    assert.ok(got.equals(big), 'bytes past the first packet must survive');
   });
 
   section('file tools');
