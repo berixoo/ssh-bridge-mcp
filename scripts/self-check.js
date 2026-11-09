@@ -915,39 +915,45 @@ async function main() {
     });
   });
 
-  section('channel concurrency (sshd MaxSessions)');
-  await checkAsync('channel opens never exceed maxConcurrentChannels', async () => {
-    let inFlight = 0;
-    let peak = 0;
-    const b = createBridge({ ...BASE_CFG, maxConcurrentChannels: 3 }, {
-      clientFactory: () => ({
-        on(ev, fn) { (this.h = this.h || {})[ev] = fn; return this; },
-        connect() { setImmediate(() => this.h.ready()); },
-        end() {},
-        exec(cmd, opts, cb) {
-          inFlight++;
-          peak = Math.max(peak, inFlight);
-          const { EventEmitter } = require('events');
-          const ch = new EventEmitter();
-          ch.stdin = { write: (d, f) => f && f(), end() {} };
-          ch.stderr = new EventEmitter();
-          cb(null, ch);
-          setTimeout(() => {
-            inFlight--;
-            ch.emit('exit', 0);
-            ch.emit('close', 0);
-          }, 5);
-          return ch;
-        },
-      }),
+  section('connection pool');
+  await checkAsync('channels never exceed channelsPerConnection on any one connection', async () => {
+    // The point of the pool: spread channels over connections instead of
+    // queueing everything behind one TCP connection.
+    const perConn = new Map();
+    let peakPerConn = 0;
+    const b = createBridge({ ...BASE_CFG, poolSize: 3, channelsPerConnection: 2 }, {
+      clientFactory: () => {
+        const id = Symbol('conn');
+        return {
+          on(ev, fn) { (this.h = this.h || {})[ev] = fn; return this; },
+          connect() { setImmediate(() => this.h.ready()); },
+          end() {},
+          exec(cmd, opts, cb) {
+            if (!perConn.has(id)) perConn.set(id, 0);
+            perConn.set(id, perConn.get(id) + 1);
+            peakPerConn = Math.max(peakPerConn, perConn.get(id));
+            const { EventEmitter } = require('events');
+            const ch = new EventEmitter();
+            ch.stdin = { write: (d, f) => f && f(), end() {} };
+            ch.stderr = new EventEmitter();
+            cb(null, ch);
+            setTimeout(() => {
+              perConn.set(id, perConn.get(id) - 1);
+              ch.emit('exit', 0);
+              ch.emit('close', 0);
+            }, 5);
+            return ch;
+          },
+        };
+      },
       configFile,
     });
-    await Promise.all(Array.from({ length: 12 }, () => b.runCommand('dev01', { command: 'true' })));
-    assert.ok(peak <= 3, `opened ${peak} channels at once, cap was 3`);
-    assert.strictEqual(inFlight, 0, 'every channel slot must be released');
+    await Promise.all(Array.from({ length: 18 }, () => b.runCommand('dev01', { command: 'true' })));
+    assert.ok(peakPerConn <= 2, `one connection carried ${peakPerConn} channels, cap was 2`);
+    assert.ok(perConn.size > 1, `only ${perConn.size} connection(s) used; the pool did not spread the load`);
   });
   await checkAsync('a burst still completes every call', async () => {
-    const b = createBridge({ ...BASE_CFG, maxConcurrentChannels: 2 }, {
+    const b = createBridge({ ...BASE_CFG, poolSize: 2, channelsPerConnection: 2 }, {
       clientFactory: () => ({
         on(ev, fn) { (this.h = this.h || {})[ev] = fn; return this; },
         connect() { setImmediate(() => this.h.ready()); },
@@ -966,6 +972,61 @@ async function main() {
     });
     const rs = await Promise.all(Array.from({ length: 20 }, (_, i) => b.runCommand('dev01', { command: `echo ${i}` })));
     assert.strictEqual(rs.length, 20);
+  });
+  await checkAsync('the pool is used before overflow, and overflow is bounded', async () => {
+    let opened = 0;
+    const b = createBridge({ ...BASE_CFG, poolSize: 2, channelsPerConnection: 2 }, {
+      clientFactory: () => {
+        opened++;
+        return {
+          on(ev, fn) { (this.h = this.h || {})[ev] = fn; return this; },
+          connect() { setImmediate(() => this.h.ready()); },
+          end() {},
+          exec(cmd, opts, cb) {
+            const { EventEmitter } = require('events');
+            const ch = new EventEmitter();
+            ch.stdin = { write: (d, f) => f && f(), end() {} };
+            ch.stderr = new EventEmitter();
+            cb(null, ch);
+            setTimeout(() => { ch.emit('exit', 0); ch.emit('close', 0); }, 5);
+            return ch;
+          },
+        };
+      },
+      configFile,
+    });
+    // Pool capacity is 2 x 2 = 4. A burst of 8 may open one overflow connection
+    // to make progress, but must not scale with the burst size.
+    await Promise.all(Array.from({ length: 8 }, () => b.runCommand('dev01', { command: 'true' })));
+    assert.ok(opened <= 3, `opened ${opened} connections for a pool of 2; overflow should not scale with concurrency`);
+  });
+  await checkAsync('a steady load stays within the pool size', async () => {
+    let opened = 0;
+    const b = createBridge({ ...BASE_CFG, poolSize: 2, channelsPerConnection: 2 }, {
+      clientFactory: () => {
+        opened++;
+        return {
+          on(ev, fn) { (this.h = this.h || {})[ev] = fn; return this; },
+          connect() { setImmediate(() => this.h.ready()); },
+          end() {},
+          exec(cmd, opts, cb) {
+            const { EventEmitter } = require('events');
+            const ch = new EventEmitter();
+            ch.stdin = { write: (d, f) => f && f(), end() {} };
+            ch.stderr = new EventEmitter();
+            cb(null, ch);
+            setImmediate(() => { ch.emit('exit', 0); ch.emit('close', 0); });
+            return ch;
+          },
+        };
+      },
+      configFile,
+    });
+    // Four at a time fits exactly in 2 connections x 2 channels.
+    for (let round = 0; round < 3; round++) {
+      await Promise.all(Array.from({ length: 4 }, () => b.runCommand('dev01', { command: 'true' })));
+    }
+    assert.ok(opened <= 2, `opened ${opened} connections under a load that fits the pool`);
   });
 
   section('persistent shell: OSC 133 parsing');

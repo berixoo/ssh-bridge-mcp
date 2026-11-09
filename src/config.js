@@ -31,6 +31,10 @@ const ConfigSchema = z
     algorithms: z.record(z.string(), z.any()).optional(),
     // restore ssh2's full default offer (put back ssh-rsa / hmac-sha1)
     allowLegacyAlgorithms: z.boolean().optional(),
+    // connection pool per host. MaxSessions (sshd, default 10) caps concurrent
+    // channels per connection, so throughput scales with the pool, not the queue.
+    poolSize: z.number().int().min(1).max(16).optional(),
+    channelsPerConnection: z.number().int().min(1).max(8).optional(),
   })
   .refine((c) => Object.keys(c.hosts).length > 0, { message: 'at least one host required' });
 

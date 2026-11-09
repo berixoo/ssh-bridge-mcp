@@ -128,7 +128,9 @@ run_command(command="echo $FOO",   session=true)  -> 1
 - **TCP_NODELAY**：ssh2 自建 socket 且不关 Nagle，Windows 上 Nagle + 延迟 ACK 让每次小往返卡 ~170 ms。现在自己建 socket 并 `setNoDelay(true)`，实测 40 次 `list_dir` 从 6810 ms 降到 **59 ms**。
 - **SFTP 会话复用**：每个 host 缓存一条 SFTP 会话（原来是每次调用新建），失败时丢弃并重建一次。20 个并发 `write_file` 只需 50 ms。
 - **TCP keepalive**：空闲连接每 30 s 探活，避免跨 agent 轮次被 NAT 掐断。
-- **并发闸门**：sshd 的 `MaxSessions`（默认 10）限制单连接并发通道数，**超了会重置整条连接**——一次并发突发会让所有调用一起失败。现在通道开启用信号量限流（默认 8，可用 `maxConcurrentChannels` 调整），只串行化通道建立，命令仍并行。实测 12/20/30/50 并发各 3 轮全部 100% 成功；修复前 20 并发是 0/20 且连接被 `ECONNRESET`。
+
+- **并发池**：sshd 的 `MaxSessions`（默认 10）限制**单连接**的并发通道数，实测 OpenSSH 9.6 上第 11 个通道就开始失败。所以吞吐不能靠在一个连接上排队。现在每个 host 维护一个连接池（`poolSize`，默认 4），每条连接最多 6 个通道（`channelsPerConnection`，上限 8），按「最空闲」分配。SFTP 会话和持久 shell 长期各占一个通道，也计入对应连接的负载——旧实现开完 SFTP 就释放计数、却一直占着通道，是文件工具拖垮执行路径的原因。
+  实测（同 LAN）：128 并发从 46/128 成功提升到 **128/128**；64 并发耗时从 573 ms 降到 186 ms，32 并发 16.7ms/op → 4.0ms/op。
 - **重试退避**：通道类错误（含 ssh2 的 `Not connected`、`Unable to exec`、`No response from server`）会丢弃连接并以 100/200/400 ms 退避重建，最多 3 次。
 - **重连告警**：连接确实丢过并重建时，下一次成功的结果里会多一个 `warning` 字段，明确说明「连接曾断开重建，断开前的工作目录、环境变量、后台任务都已失效」。不告诉 Agent 的话，它会拿过期状态继续操作。
 - **`pipefail`**（可选）：`cat /etc/shadow | head -1` 默认会以 0 退出，把权限错误报成成功；传 `pipefail: true` 可让管道任一段失败即失败。默认关，因为会改变 `cmd | head` 的正常行为。

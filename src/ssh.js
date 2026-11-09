@@ -367,17 +367,27 @@ function connectSocket(host, port) {
 }
 
 function createBridge(cfg, { clientFactory = defaultClientFactory, configFile = configPath() } = {}) {
-  const conns = new Map();
-  const sftps = new Map();
+  // A pool per host, not a single connection. sshd allows MaxSessions (10 by
+  // default) concurrent channels *per connection*, so one TCP connection caps
+  // throughput no matter how much you queue on it -- measured: 8 concurrent
+  // calls at 2.0 ms each, 16 at 13.6 ms (queueing), 128 at 46/128 failures.
+  // Spreading channels over several connections raises the real ceiling and
+  // removes head-of-line blocking when one call is slow.
+  //
+  // Each entry: { client, channels, closing }
+  const pools = new Map(); // hostName -> Entry[]
+  const sftps = new Map(); // hostName -> cached SFTP session
   const tasks = new Map();
   const hostKeys = createKnownHostsStore(knownHostsPaths(cfg, configFile));
 
-  // sshd counts concurrent channels per connection (MaxSessions, 10 by default)
-  // and resets the whole connection when it is exceeded -- one burst of parallel
-  // tool calls could take the bridge down for every caller, not just the ones
-  // over the line. A semaphore keeps us under the cap. Only the channel setup is
-  // serialised; commands still run concurrently.
-  const MAX_CHANNELS = cfg.maxConcurrentChannels || 8;
+  const POOL_SIZE = Math.max(1, cfg.poolSize || 4);
+  // sshd's MaxSessions is the hard limit on concurrent channels per connection.
+  // Measured on OpenSSH 9.6: exactly 10 channels open, the 11th fails. Keep a
+  // margin because the SFTP session and a persistent shell each hold one too,
+  // and because our count drops before the server's session table does.
+  const CHANNELS_PER_CONN = Math.max(1, Math.min(cfg.channelsPerConnection || 6, 8));
+  // Global per-host cap: open channels across every connection in the pool.
+  const MAX_CHANNELS = POOL_SIZE * CHANNELS_PER_CONN;
   let freeSlots = MAX_CHANNELS;
   const channelWaiters = [];
   function acquireChannel() {
@@ -410,11 +420,171 @@ function createBridge(cfg, { clientFactory = defaultClientFactory, configFile = 
   }
   function dispose(name) {
     dropSftp(name);
-    const p = conns.get(name);
-    if (!p) return;
-    conns.delete(name);
-    p.then((c) => { try { c.end(); } catch (_) {} }).catch(() => {});
+    const entries = pools.get(name);
+    if (!entries) return;
+    pools.delete(name);
+    for (const e of entries) closeEntry(e);
   }
+
+  function closeEntry(entry) {
+    entry.closing = true;
+    try { entry.client.end(); } catch (_) {}
+    // Drop it from whatever pool still references it.
+    for (const [host, list] of pools) {
+      const i = list.indexOf(entry);
+      if (i !== -1) {
+        list.splice(i, 1);
+        if (list.length === 0) pools.delete(host);
+      }
+    }
+  }
+
+  // Connections that are still being established. Without this, N concurrent
+  // calls all see an empty pool and each opens its own connection, blowing
+  // straight through POOL_SIZE.
+  const pending = new Map(); // hostName -> Promise<Entry>
+
+  // Picks a connection and reserves a channel on it in one step. Selection and
+  // reservation must be atomic: with a plain "pick, then increment", a burst of
+  // concurrent calls all observe channels=0 and pile onto the same connection.
+  function reserveConnection(name) {
+    for (;;) {
+      const list = pools.get(name) || [];
+      const live = list.filter((e) => !e.closing && e.channels < CHANNELS_PER_CONN);
+      if (live.length > 0) {
+        live.sort((a, b) => a.channels - b.channels);
+        const e = live[0];
+        e.channels++;
+        return { entry: e, reserved: true };
+      }
+      return null;
+    }
+  }
+
+  async function pickConnection(name) {
+    const got = reserveConnection(name);
+    if (got) return got;
+
+    // Another connection is already being established: wait for it instead of
+    // opening a parallel one.
+    if (pending.has(name)) {
+      await pending.get(name).catch(() => {});
+      return pickConnection(name);
+    }
+    const list = pools.get(name) || [];
+    if (list.length < POOL_SIZE) {
+      const entry = await openConnection(name);
+      entry.channels++;
+      return { entry, reserved: true };
+    }
+    // Pool is full and every connection is saturated. Wait for the global
+    // semaphore -- it is released when *any* channel anywhere finishes -- then
+    // rescan. Opening another connection here is what let a burst open one
+    // connection per queued call.
+    for (;;) {
+      await acquireChannel();
+      const again = reserveConnection(name);
+      if (again) return { entry: again.entry, reserved: true, _globalHeld: true };
+      // Nothing freed up on this host (the slot went to another host); keep
+      // waiting rather than growing the pool without bound.
+      releaseChannel();
+      await new Promise((r) => setTimeout(r, 10));
+    }
+  }
+
+  async function openConnection(name) {
+    const p = (async () => {
+      const entry = resolveHost(cfg, name);
+    // ssh2 creates its own socket and never disables Nagle. On Windows that
+    // combination (Nagle + delayed ACK) puts a ~170 ms stall on every small
+    // request/response: 20 serial SFTP ops measured 3363 ms with it and 34 ms
+    // without. Each tool call issues several round trips, so this is the
+    // single biggest latency fix in the bridge. Tests inject clientFactory
+    // and get no socket, so the fakes keep working.
+    const sock = clientFactory === defaultClientFactory
+      ? await connectSocket(entry.host, entry.port)
+      : undefined;
+    const client = await new Promise((resolve, reject) => {
+      const c = clientFactory({ sock });
+      let ready = false;
+      // hostVerifier has no error channel, so a rejection reason is parked here
+      // and surfaced through the 'error' event that follows it. Without this the
+      // user only sees ssh2's generic "Host denied (verification failed)".
+      let hostKeyFailure = null;
+      c.on('ready', () => { ready = true; resolve(c); });
+      c.on('error', (err) => reject(new Error(`SSH connection to ${entry.name} failed: ${hostKeyFailure || err.message}`)));
+      // A connection that closes is dead. If it never became ready the pending
+      // promise must not hang, and once ready it must leave the pool so the
+      // next call rebuilds instead of reusing a stale client.
+      c.on('close', () => {
+        if (!ready) reject(new Error(`SSH connection to ${entry.name} closed before ready`));
+        const list = pools.get(entry.name);
+        if (!list) return;
+        const i = list.findIndex((e) => e.client === c);
+        if (i !== -1) list.splice(i, 1);
+        if (list.length === 0) pools.delete(entry.name);
+      });
+      c.connect({
+        host: entry.host,
+        port: entry.port,
+        username: entry.user,
+        password: entry.password,
+        readyTimeout: 15000,
+        sock,
+        algorithms: connectAlgorithms(cfg),
+        // ssh2 auto-accepts whatever host key answers unless this is set, which
+        // would hand the password to an impersonator on the LAN.
+        hostVerifier: (blob) => {
+          const verdict = verifyHostKey({
+            store: hostKeys,
+            policy: entry.hostKeyPolicy,
+            host: entry.host,
+            port: entry.port,
+            blob,
+            label: entry.name,
+            pinnedFingerprint: entry.hostKeyFingerprint,
+          });
+          if (!verdict.ok) hostKeyFailure = verdict.message;
+          return verdict.ok;
+        },
+      });
+    });
+    const entryRec = { client, channels: 0, closing: false };
+    const list = pools.get(name) || [];
+    list.push(entryRec);
+    pools.set(name, list);
+    return entryRec;
+    })();
+    pending.set(name, p);
+    try {
+      return await p;
+    } finally {
+      if (pending.get(name) === p) pending.delete(name);
+    }
+  }
+
+
+  // Runs fn with a channel slot held on a specific pooled connection. The
+  // caller must release the slot (execChannel does it on every exit path).
+  async function withChannelSlot(name, fn) {
+    // pickConnection already reserved one channel on the returned entry.
+    const { entry, _globalHeld } = await pickConnection(name);
+    if (!_globalHeld) await acquireChannel();
+    let released = false;
+    const release = () => {
+      if (released) return;
+      released = true;
+      entry.channels--;
+      releaseChannel();
+    };
+    try {
+      return await fn(entry.client, release);
+    } catch (err) {
+      release();
+      throw err;
+    }
+  }
+
   // Hosts whose connection was dropped and rebuilt at least once. An agent that
   // is told nothing carriers on against stale state (a shell that is gone, a
   // cwd that no longer applies), so the result carries a warning.
@@ -448,95 +618,48 @@ function createBridge(cfg, { clientFactory = defaultClientFactory, configFile = 
     throw lastErr;
   }
 
-  function getConn(name) {
-    if (conns.has(name)) return conns.get(name);
-    const p = (async () => {
-      const entry = resolveHost(cfg, name);
-      // ssh2 creates its own socket and never disables Nagle. On Windows that
-      // combination (Nagle + delayed ACK) puts a ~170 ms stall on every small
-      // request/response: 20 serial SFTP ops measured 3363 ms with it and 34 ms
-      // without. Each tool call issues several round trips, so this is the
-      // single biggest latency fix in the bridge. Tests inject clientFactory
-      // and get no socket, so the fakes keep working.
-      const sock = clientFactory === defaultClientFactory
-        ? await connectSocket(entry.host, entry.port)
-        : undefined;
-      return await new Promise((resolve, reject) => {
-        const client = clientFactory({ sock });
-        let ready = false;
-        // hostVerifier has no error channel, so a rejection reason is parked here
-        // and surfaced through the 'error' event that follows it. Without this the
-        // user only sees ssh2's generic "Host denied (verification failed)".
-        let hostKeyFailure = null;
-        client.on('ready', () => { ready = true; resolve(client); });
-        client.on('error', (err) => reject(new Error(`SSH connection to ${entry.name} failed: ${hostKeyFailure || err.message}`)));
-        // A connection that closes is dead: if it never became ready the pending
-        // promise must not hang, and once ready the pool must drop it so the
-        // next call rebuilds instead of reusing a stale client.
-        client.on('close', () => {
-          if (!ready) reject(new Error(`SSH connection to ${entry.name} closed before ready`));
-          if (conns.get(name) === p) conns.delete(name);
-        });
-        client.connect({
-          host: entry.host,
-          port: entry.port,
-          username: entry.user,
-          password: entry.password,
-          readyTimeout: 15000,
-          sock,
-          algorithms: connectAlgorithms(cfg),
-          // ssh2 auto-accepts whatever host key answers unless this is set, which
-          // would hand the password to an impersonator on the LAN.
-          hostVerifier: (blob) => {
-            const verdict = verifyHostKey({
-              store: hostKeys,
-              policy: entry.hostKeyPolicy,
-              host: entry.host,
-              port: entry.port,
-              blob,
-              label: entry.name,
-              pinnedFingerprint: entry.hostKeyFingerprint,
-            });
-            if (!verdict.ok) hostKeyFailure = verdict.message;
-            return verdict.ok;
-          },
-        });
-      });
-    })().catch((err) => {
-      conns.delete(name);
-      throw err;
-    });
-    conns.set(name, p);
-    return p;
-  }
-
   // One cached SFTP session per host. Opening one per call burned a channel and
   // a round trip on every file operation; on a long agent session that is both
   // slow and a MaxSessions risk. The session is reused until an operation on it
   // fails, at which point withSftp() drops it and retries once on a fresh one.
   async function getSftp(name) {
-    if (sftps.has(name)) return sftps.get(name);
-    const client = await getConn(name);
-    // Opening an SFTP session is a channel open too, so it waits for a slot --
-    // but only while being created: the session is cached and long-lived, so
-    // holding the slot afterwards would starve every exec call.
-    await acquireChannel();
-    const p = new Promise((resolve, reject) =>
-      client.sftp((e, s) => {
-        releaseChannel();
-        return e ? reject(e) : resolve(s);
-      })
-    );
-    sftps.set(name, p);
-    p.catch(() => { if (sftps.get(name) === p) sftps.delete(name); });
-    return p;
+    const cached = sftps.get(name);
+    if (cached) return cached.session;
+    // The SFTP session is a long-lived channel: it holds one slot for as long as
+    // it exists. Counting it against the connection that hosts it is what keeps
+    // file tools from eating the capacity exec needs -- the old code released
+    // the slot right after opening and then quietly held a channel forever.
+    // pickConnection reserved a channel for us; the session keeps it for life.
+    const { entry, _globalHeld } = await pickConnection(name);
+    if (!_globalHeld) await acquireChannel();
+    const record = { entry, session: null };
+    sftps.set(name, record);
+    try {
+      record.session = await new Promise((resolve, reject) =>
+        entry.client.sftp((e, s) => (e ? reject(e) : resolve(s)))
+      );
+      return record.session;
+    } catch (e) {
+      entry.channels--;
+      releaseChannel();
+      sftps.delete(name);
+      throw e;
+    }
   }
 
   function dropSftp(name) {
-    const p = sftps.get(name);
-    if (!p) return;
+    const record = sftps.get(name);
+    if (!record) return;
     sftps.delete(name);
-    p.then((s) => { try { s.end(); } catch (_) {} }).catch(() => {});
+    // Release on the exact connection that hosted the session.
+    record.entry.channels = Math.max(0, record.entry.channels - 1);
+    releaseChannel();
+    if (record.session) {
+      try { record.session.end(); } catch (_) {}
+    } else {
+      // Still opening: let it finish, then close it.
+      Promise.resolve().then(() => { try { record.session && record.session.end(); } catch (_) {} });
+    }
   }
 
   // Runs fn(sftp) and, if the session itself turns out to be dead, rebuilds it
@@ -552,7 +675,7 @@ function createBridge(cfg, { clientFactory = defaultClientFactory, configFile = 
     }
   }
 
-  function execChannel(client, { command, cwd, timeoutMs, sudo, pty, env, input, pipefail, sudoPassword }) {
+  function execChannel(client, { command, cwd, timeoutMs, sudo, pty, env, input, pipefail, sudoPassword, channelRelease }) {
     // Every non-pty command runs through `bash -c` so a timeout can kill the
     // whole process tree via killProcessGroup. setsid is avoided entirely:
     // util-linux setsid forks, which swallows the exit code and redirects
@@ -579,7 +702,9 @@ function createBridge(cfg, { clientFactory = defaultClientFactory, configFile = 
       // The slot is held from just before the channel opens until the command
       // finishes, on every exit path.
       let slotHeld = false;
-      const releaseSlot = () => { if (slotHeld) { slotHeld = false; releaseChannel(); } };
+      // The slot is owned by the pool (withChannelSlot); execChannel only has to
+      // hand it back exactly once, on whichever exit path happens first.
+      const releaseSlot = () => { if (slotHeld) { slotHeld = false; channelRelease(); } };
       const finish = (res) => {
         releaseSlot();
         if (res) {
@@ -605,10 +730,8 @@ function createBridge(cfg, { clientFactory = defaultClientFactory, configFile = 
           reject(new Error('connection closed before command completed'));
         }
       };
-      // Acquire a channel slot first: sshd's MaxSessions (10 by default) counts
-      // concurrent channels per connection, and exceeding it resets the whole
-      // connection rather than failing one call.
-      acquireChannel().then(() => {
+      // The caller already reserved a channel slot via withChannelSlot.
+      {
         slotHeld = true;
         // client.exec throws synchronously when the connection is already gone
         // ("Not connected"), so it cannot be left to the callback.
@@ -710,7 +833,7 @@ function createBridge(cfg, { clientFactory = defaultClientFactory, configFile = 
             finish({ exitCode, stdout, stderr, timedOut, truncated: stdoutTruncated || stderrTruncated });
           });
         }
-      }, reject);
+      }
     });
   }
 
@@ -724,21 +847,23 @@ function createBridge(cfg, { clientFactory = defaultClientFactory, configFile = 
     const existing = shells.get(name);
     if (existing) return existing.ready;
 
-    const rec = { ch: null, client: null, buf: '', queue: [], exited: false, ready: null };
+    const rec = { ch: null, client: null, entry: null, buf: '', queue: [], exited: false, ready: null };
     rec.ready = (async () => {
-      const client = await getConn(name);
-      rec.client = client;
-      await acquireChannel();
+      // The shell is a long-lived channel, so like the SFTP session it keeps its
+      // slot for its whole life and is counted on the connection that hosts it.
+      const { entry, _globalHeld } = await pickConnection(name);
+      if (!_globalHeld) await acquireChannel();
+      rec.entry = entry;
+      rec.client = entry.client;
       const ch = await new Promise((resolve, reject) => {
         try {
-          client.shell({ term: 'dumb', cols: 200, rows: 50 }, (e, c) => (e ? reject(e) : resolve(c)));
+          entry.client.shell({ term: 'dumb', cols: 200, rows: 50 }, (e, c) => (e ? reject(e) : resolve(c)));
         } catch (e) { reject(e); }
       });
-      releaseChannel();
       rec.ch = ch;
       ch.on('data', (d) => { rec.buf += d.toString(); });
-      ch.on('close', () => { rec.exited = true; shells.delete(name); });
-      ch.on('error', () => { rec.exited = true; shells.delete(name); });
+      ch.on('close', () => { rec.exited = true; shells.delete(name); releaseShellSlot(rec); });
+      ch.on('error', () => { rec.exited = true; shells.delete(name); releaseShellSlot(rec); });
       // Wait for the bootstrap to finish before accepting commands.
       await new Promise((resolve, reject) => {
         const t = setTimeout(() => reject(new Error('shell bootstrap timed out')), 15000);
@@ -751,7 +876,7 @@ function createBridge(cfg, { clientFactory = defaultClientFactory, configFile = 
         tick();
       });
       return rec;
-    })().catch((e) => { shells.delete(name); throw e; });
+    })().catch((e) => { shells.delete(name); releaseShellSlot(rec); throw e; });
     shells.set(name, rec);
     return rec.ready;
   }
@@ -773,6 +898,7 @@ function createBridge(cfg, { clientFactory = defaultClientFactory, configFile = 
             // than inheriting a wedged bash.
             try { rec.ch.close(); } catch (_) {}
             shells.delete(name);
+            releaseShellSlot(rec);
             finish(null, new Error(`shell command timed out after ${timeout}ms`));
           }, timeout);
           const poll = () => {
@@ -813,12 +939,22 @@ function createBridge(cfg, { clientFactory = defaultClientFactory, configFile = 
     );
   }
 
+  // The shell's channel slot is released exactly once, whichever path closes it
+  // (explicit close, timeout, or the channel dying on its own).
+  function releaseShellSlot(rec) {
+    if (!rec || rec.slotReleased) return;
+    rec.slotReleased = true;
+    if (rec.entry) rec.entry.channels = Math.max(0, rec.entry.channels - 1);
+    releaseChannel();
+  }
+
   async function closeShell(name) {
     const rec = shells.get(name);
     if (!rec) return { ok: true, closed: false };
     shells.delete(name);
     try { await rec.ready; } catch (_) {}
     try { if (rec.ch) rec.ch.close(); } catch (_) {}
+    releaseShellSlot(rec);
     return { ok: true, closed: true };
   }
 
@@ -837,10 +973,11 @@ function createBridge(cfg, { clientFactory = defaultClientFactory, configFile = 
     // Resolve the connection *after* the slot is granted: waiting on the
     // semaphore can outlive the connection it was queued behind, and using a
     // disposed client fails with "Not connected" instead of retrying.
-    return withRetry(entry.name, async () => {
-      const client = await getConn(entry.name);
-      return execChannel(client, { ...args, sudoPassword: entry.sudoPassword });
-    });
+    return withRetry(entry.name, () =>
+      withChannelSlot(entry.name, (client, release) =>
+        execChannel(client, { ...args, sudoPassword: entry.sudoPassword, channelRelease: release })
+      )
+    );
   }
 
   function listHosts() {
