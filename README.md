@@ -85,7 +85,31 @@ claude mcp add ssh-bridge -- node <path-to>/ssh-bridge-mcp/src/server.js
 | `background_logs` | 读后台进程日志（增量，从上次读的位置起；`truncated: true` 表示还有，继续调） |
 | `stop_background` | 终止后台进程 |
 
-`run_command` 参数：`host` / `command` / `cwd` / `timeout_ms` / `sudo` / `pty` / `env` / `input` / `pipefail`。`host` 可省略，缺省连配置的默认主机。
+`run_command` 参数：`host` / `command` / `cwd` / `timeout_ms` / `sudo` / `pty` / `env` / `input` / `pipefail` / `session`。`host` 可省略，缺省连配置的默认主机。
+
+### 持久 shell 会话
+
+默认每条命令是独立的：`cd /tmp` 之后下一条调用又回到 home，`export` 的东西也带不过去。传 `session: true` 则改用一个**长期存活的交互式 bash**，`cwd`、环境变量、shell 函数、alias 都跨调用保留：
+
+```
+run_command(command="cd /project", session=true)
+run_command(command="pwd",         session=true)  -> /project
+run_command(command="export FOO=1",session=true)
+run_command(command="echo $FOO",   session=true)  -> 1
+```
+
+用 `persistent_shell_close` 丢弃该 host 的会话（状态清零，下次重新开）。
+
+**实现**用的是 **OSC 133**（FinalTerm 终端集成协议），不是「命令后 echo 一个哨兵再扫输出」。哨兵是混在数据流里的普通文本，`sudo`/`ssh` 首连/`mysql -p` 这类抢 stdin 的程序会把它当输入吃掉、命令挂到超时，大输出还可能把它挤出缓冲；OSC 133 的标记以 ESC 字节开头，普通文本伪造不出来。shell 侧只挂 `PROMPT_COMMAND` 打印 `ESC]133;D;<exit>BEL` 和 `ESC]133;A BEL`，**不用 DEBUG trap**（它每个命令和子 shell 各触发一次，实测会产生重复标记）。
+
+几个实现上的坑（都验证过）：
+- `$?` 必须先存进变量再 printf，否则报的是 hook 自己的退出码（`false` 会返回 0）。
+- 标记在 shell 源码里写成 `\033`，由 `printf` 运行时解释；直接嵌真 ESC 字节会被 PTY 行编辑器吃掉。
+- 开机脚本的回显里也含就绪标记的字符串，所以就绪判定要求该标记**独占一行**。
+- PTY 会回显命令本身，输出清洗时按行匹配去掉，多行命令的 `>` 续行提示一并处理。
+
+**限制**：`session` 与 `sudo` 不兼容（交互式 shell 里 sudo 会吃掉命令边界），会明确报错而不是默默出错。
+
 
 ### 截图
 
@@ -106,6 +130,7 @@ claude mcp add ssh-bridge -- node <path-to>/ssh-bridge-mcp/src/server.js
 - **TCP keepalive**：空闲连接每 30 s 探活，避免跨 agent 轮次被 NAT 掐断。
 - **并发闸门**：sshd 的 `MaxSessions`（默认 10）限制单连接并发通道数，**超了会重置整条连接**——一次并发突发会让所有调用一起失败。现在通道开启用信号量限流（默认 8，可用 `maxConcurrentChannels` 调整），只串行化通道建立，命令仍并行。实测 12/20/30/50 并发各 3 轮全部 100% 成功；修复前 20 并发是 0/20 且连接被 `ECONNRESET`。
 - **重试退避**：通道类错误（含 ssh2 的 `Not connected`、`Unable to exec`、`No response from server`）会丢弃连接并以 100/200/400 ms 退避重建，最多 3 次。
+- **重连告警**：连接确实丢过并重建时，下一次成功的结果里会多一个 `warning` 字段，明确说明「连接曾断开重建，断开前的工作目录、环境变量、后台任务都已失效」。不告诉 Agent 的话，它会拿过期状态继续操作。
 - **`pipefail`**（可选）：`cat /etc/shadow | head -1` 默认会以 0 退出，把权限错误报成成功；传 `pipefail: true` 可让管道任一段失败即失败。默认关，因为会改变 `cmd | head` 的正常行为。
 
 ### 已知语义限制

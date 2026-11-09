@@ -53,6 +53,7 @@ server.registerTool('run_command', {
     env: z.record(z.string(), z.string()).optional(),
     input: z.string().optional().describe('one-shot stdin, written then closed'),
     pipefail: z.boolean().optional().default(false).describe('fail when any stage of a pipeline fails; catches `cmd | head` masking a real error'),
+    session: z.boolean().optional().default(false).describe('run in a persistent shell so cwd/env/functions survive between calls (persistent_shell_close to reset). Not compatible with sudo.'),
   },
 }, async (args) => {
   try {
@@ -173,6 +174,13 @@ server.registerTool('screenshot', {
       ],
     };
   } catch (e) { throw toolError(e); }
+});
+
+server.registerTool('persistent_shell_close', {
+  description: 'Close the persistent shell for a host (opened by run_command with session:true). Its cwd/env state is discarded; the next session call starts a fresh shell.',
+  inputSchema: { host: hostSchema },
+}, async (args) => {
+  try { return ok(await bridge.closeShell(args.host)); } catch (e) { throw toolError(e); }
 });
 
 server.registerTool('start_background', {

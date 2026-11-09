@@ -7,6 +7,7 @@ const { resolveHost, knownHostsPaths, configPath } = require('./config');
 const { createKnownHostsStore, verifyHostKey } = require('./hostkeys');
 const { checkLocalPath } = require('./paths');
 const { buildCaptureScript, buildOptimizeScript, parseCaptureResult, looksLikeImage } = require('./screenshot');
+const { bootstrapScript, bootstrapDone, drainBuffer, cleanOutput } = require('./shell');
 
 const MAX_OUTPUT = 500 * 1024;
 const BG_GRACE_MS = 1500;
@@ -414,6 +415,11 @@ function createBridge(cfg, { clientFactory = defaultClientFactory, configFile = 
     conns.delete(name);
     p.then((c) => { try { c.end(); } catch (_) {} }).catch(() => {});
   }
+  // Hosts whose connection was dropped and rebuilt at least once. An agent that
+  // is told nothing carriers on against stale state (a shell that is gone, a
+  // cwd that no longer applies), so the result carries a warning.
+  const reconnected = new Set();
+
   async function withRetry(name, fn) {
     // Channel exhaustion is transient: the server frees the sessions when the
     // connection drops. One immediate rebuild is not always enough under a
@@ -421,10 +427,20 @@ function createBridge(cfg, { clientFactory = defaultClientFactory, configFile = 
     let lastErr;
     for (let attempt = 0; attempt < 3; attempt++) {
       try {
-        return await fn();
+        const res = await fn();
+        if (reconnected.has(name)) {
+          reconnected.delete(name);
+          // Attach the warning to whatever shape the tool returns, without
+          // dropping fields the caller expects.
+          if (res && typeof res === 'object' && !Array.isArray(res)) {
+            res.warning = `[WARNING] SSH connection to "${name}" was lost and re-established; any state from before the drop (cwd, env, background jobs) is gone.`;
+          }
+        }
+        return res;
       } catch (err) {
         if (!isChannelFailure(err)) throw err;
         lastErr = err;
+        reconnected.add(name);
         dispose(name);
         await new Promise((r) => setTimeout(r, 100 * 2 ** attempt));
       }
@@ -698,8 +714,126 @@ function createBridge(cfg, { clientFactory = defaultClientFactory, configFile = 
     });
   }
 
+  // ── persistent shells ────────────────────────────────────────────────────
+  // One long-lived interactive bash per host, so cwd/env/shell-functions
+  // survive between calls. Opt-in: runCommand({ session: true }) uses it, and
+  // the default one-shot path is untouched.
+  const shells = new Map(); // hostName -> { ch, client, ready, buf, queue, exited }
+
+  function openShellSession(name) {
+    const existing = shells.get(name);
+    if (existing) return existing.ready;
+
+    const rec = { ch: null, client: null, buf: '', queue: [], exited: false, ready: null };
+    rec.ready = (async () => {
+      const client = await getConn(name);
+      rec.client = client;
+      await acquireChannel();
+      const ch = await new Promise((resolve, reject) => {
+        try {
+          client.shell({ term: 'dumb', cols: 200, rows: 50 }, (e, c) => (e ? reject(e) : resolve(c)));
+        } catch (e) { reject(e); }
+      });
+      releaseChannel();
+      rec.ch = ch;
+      ch.on('data', (d) => { rec.buf += d.toString(); });
+      ch.on('close', () => { rec.exited = true; shells.delete(name); });
+      ch.on('error', () => { rec.exited = true; shells.delete(name); });
+      // Wait for the bootstrap to finish before accepting commands.
+      await new Promise((resolve, reject) => {
+        const t = setTimeout(() => reject(new Error('shell bootstrap timed out')), 15000);
+        const tick = () => {
+          if (bootstrapDone(rec.buf)) { clearTimeout(t); rec.buf = ''; return resolve(); }
+          if (rec.exited) { clearTimeout(t); return reject(new Error('shell exited during bootstrap')); }
+          setTimeout(tick, 20);
+        };
+        ch.write(bootstrapScript() + '\n');
+        tick();
+      });
+      return rec;
+    })().catch((e) => { shells.delete(name); throw e; });
+    shells.set(name, rec);
+    return rec.ready;
+  }
+
+  function runInShell(name, { command, timeoutMs }) {
+    return openShellSession(name).then(
+      (rec) =>
+        new Promise((resolve, reject) => {
+          const timeout = timeoutMs || 30000;
+          const started = Date.now();
+          let settled = false;
+          const finish = (res, err) => {
+            if (settled) return;
+            settled = true;
+            if (err) reject(err); else resolve(res);
+          };
+          const timer = setTimeout(() => {
+            // The shell is stuck; drop it so the next call starts clean rather
+            // than inheriting a wedged bash.
+            try { rec.ch.close(); } catch (_) {}
+            shells.delete(name);
+            finish(null, new Error(`shell command timed out after ${timeout}ms`));
+          }, timeout);
+          const poll = () => {
+            if (settled) return;
+            const { events, rest } = drainBuffer(rec.buf);
+            if (events.length > 0) {
+              rec.buf = rest;
+              clearTimeout(timer);
+              const ev = events[0];
+              return finish({
+                exitCode: ev.exit,
+                stdout: cap(cleanOutput(ev.raw, command)).text,
+                stderr: '',
+                timedOut: false,
+                truncated: false,
+                session: true,
+              });
+            }
+            if (rec.exited) {
+              clearTimeout(timer);
+              return finish(null, new Error('shell session closed'));
+            }
+            if (Date.now() - started > timeout) return; // timer handles it
+            setTimeout(poll, 10);
+          };
+          // Anything already buffered (a late marker from the previous command)
+          // is cleared so it cannot be mistaken for this command's result.
+          drainBuffer(rec.buf);
+          rec.buf = '';
+          try {
+            rec.ch.write(command + '\n');
+          } catch (e) {
+            clearTimeout(timer);
+            return finish(null, e);
+          }
+          setTimeout(poll, 10);
+        })
+    );
+  }
+
+  async function closeShell(name) {
+    const rec = shells.get(name);
+    if (!rec) return { ok: true, closed: false };
+    shells.delete(name);
+    try { await rec.ready; } catch (_) {}
+    try { if (rec.ch) rec.ch.close(); } catch (_) {}
+    return { ok: true, closed: true };
+  }
+
   function runCommand(name, args) {
     const entry = resolveHost(cfg, name);
+    if (args.session) {
+      const { session: _s, ...rest } = args;
+      // Persistent shell: cwd/env/aliases survive between calls. No sudo
+      // handling here -- sudo inside an interactive shell would prompt and
+      // consume the command boundary, so callers use the one-shot path for it.
+      if (args.sudo) {
+        return Promise.reject(new Error('session mode does not support sudo; use the one-shot run_command'));
+      }
+      return runInShell(entry.name, rest);
+    }
     // Resolve the connection *after* the slot is granted: waiting on the
     // semaphore can outlive the connection it was queued behind, and using a
     // disposed client fails with "Not connected" instead of retrying.
@@ -1065,6 +1199,7 @@ function createBridge(cfg, { clientFactory = defaultClientFactory, configFile = 
     startBackground,
     backgroundLogs,
     stopBackground,
+    closeShell,
   };
 }
 

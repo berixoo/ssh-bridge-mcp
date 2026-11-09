@@ -37,6 +37,7 @@ const {
   NO_SESSION,
 } = require(path.join(ROOT, 'src', 'screenshot.js'));
 const { resolveHost } = require(path.join(ROOT, 'src', 'config.js'));
+const { bootstrapScript, bootstrapDone, drainBuffer, cleanOutput } = require(path.join(ROOT, 'src', 'shell.js'));
 
 let pass = 0;
 const failures = [];
@@ -965,6 +966,136 @@ async function main() {
     });
     const rs = await Promise.all(Array.from({ length: 20 }, (_, i) => b.runCommand('dev01', { command: `echo ${i}` })));
     assert.strictEqual(rs.length, 20);
+  });
+
+  section('persistent shell: OSC 133 parsing');
+  {
+    const A = '\x1b]133;A\x07';
+    const D = (n) => `\x1b]133;D;${n}\x07`;
+
+    check('one command yields one event with its exit code', () => {
+      const { events } = drainBuffer(`echo hi\r\nhi\r\n${D(0)}${A}`);
+      assert.strictEqual(events.length, 1);
+      assert.strictEqual(events[0].exit, 0);
+    });
+    check('two commands are separated correctly', () => {
+      const { events } = drainBuffer(`a\r\n${D(0)}${A}b\r\n${D(1)}${A}`);
+      assert.deepStrictEqual(events.map((e) => e.exit), [0, 1]);
+    });
+    check('a non-zero exit code survives', () => {
+      const { events } = drainBuffer(`x\r\n${D(42)}${A}`);
+      assert.strictEqual(events[0].exit, 42);
+    });
+    check('an incomplete command stays in the buffer', () => {
+      const { events, rest } = drainBuffer(`${D(0)}${A}partial output`);
+      assert.strictEqual(events.length, 1);
+      assert.ok(rest.includes('partial output'));
+    });
+    check('no markers means no completed command', () => {
+      const { events, rest } = drainBuffer('just some output');
+      assert.strictEqual(events.length, 0);
+      assert.strictEqual(rest, 'just some output');
+    });
+    check('text that merely looks like a marker is not one', () => {
+      // The whole point of OSC 133: an ESC-prefixed sequence cannot be forged
+      // by printing the visible characters.
+      const { events } = drainBuffer('literally ]133;D;0 here\r\n' + D(7) + A);
+      assert.strictEqual(events.length, 1);
+      assert.strictEqual(events[0].exit, 7);
+      assert.ok(/literally/.test(events[0].raw));
+    });
+    check('echoed command line is stripped from output', () => {
+      assert.strictEqual(cleanOutput('echo hello\r\nhello\r\n', 'echo hello'), 'hello');
+    });
+    check('a multi-line echo (PS2 continuations) is stripped whole', () => {
+      const raw = 'echo "b\r\n> a\r\n> c" | sort | tr "\\n" "-"\r\na-b-c-\r\n';
+      assert.strictEqual(cleanOutput(raw, 'echo "b\na\nc" | sort | tr "\\n" "-"'), 'a-b-c-');
+    });
+    check('output that differs from the echo is preserved', () => {
+      assert.strictEqual(cleanOutput('hello\r\n', 'echo hello'), 'hello');
+    });
+    check('ANSI colour codes are removed', () => {
+      assert.strictEqual(cleanOutput('\x1b[31mred\x1b[0m\r\n', undefined), 'red');
+    });
+    check('bootstrap waits for the real ready line, not its own echo', () => {
+      const shown = `printf "\\n__BRIDGE_READY_9f3a__\\n"`;
+      assert.ok(!bootstrapDone(shown), 'the echoed source must not count as ready');
+      assert.ok(bootstrapDone(`\r\n__BRIDGE_READY_9f3a__\r\n`), 'the executed line must');
+    });
+    check('bootstrap emits no literal ESC (the PTY eats it)', () => {
+      assert.ok(!bootstrapScript().includes('\x1b'), 'markers must be produced by printf at run time');
+    });
+    check('bootstrap reads $? before anything overwrites it', () => {
+      const s = bootstrapScript();
+      assert.ok(/rc=\$\?;/.test(s), 'capture $? into a variable first');
+    });
+  }
+
+  section('reconnect warning (#3)');
+  await checkAsync('a successful call carries no warning', async () => {
+    const b = createBridge(BASE_CFG, { clientFactory: execStub({ code: 0, stdout: 'ok\n' }), configFile });
+    const r = await b.runCommand('dev01', { command: 'true' });
+    assert.strictEqual(r.warning, undefined);
+  });
+  await checkAsync('after a channel failure the next success warns that state was lost', async () => {
+    // The stub fails the first exec with a channel error, then succeeds; the
+    // bridge disposes and retries, and the result must say so.
+    let calls = 0;
+    const b = createBridge(BASE_CFG, {
+      clientFactory: () => ({
+        on(ev, fn) { (this.h = this.h || {})[ev] = fn; return this; },
+        connect() { setImmediate(() => this.h.ready()); },
+        end() {},
+        exec(cmd, opts, cb) {
+          calls++;
+          const { EventEmitter } = require('events');
+          const ch = new EventEmitter();
+          ch.stdin = { write: (d, f) => f && f(), end() {} };
+          ch.stderr = new EventEmitter();
+          if (calls === 1) return cb(new Error('channel open failure'));
+          cb(null, ch);
+          setImmediate(() => { ch.emit('exit', 0); ch.emit('close', 0); });
+          return ch;
+        },
+      }),
+      configFile,
+    });
+    const r = await b.runCommand('dev01', { command: 'true' });
+    assert.strictEqual(r.exitCode, 0);
+    assert.ok(/re-established/.test(r.warning || ''), `expected a reconnect warning, got ${JSON.stringify(r.warning)}`);
+    assert.ok(/state .* is gone/.test(r.warning || ''), 'the warning must say state was lost, not just "reconnected"');
+  });
+  await checkAsync('the warning is emitted once, not on every later call', async () => {
+    let calls = 0;
+    const b = createBridge(BASE_CFG, {
+      clientFactory: () => ({
+        on(ev, fn) { (this.h = this.h || {})[ev] = fn; return this; },
+        connect() { setImmediate(() => this.h.ready()); },
+        end() {},
+        exec(cmd, opts, cb) {
+          calls++;
+          const { EventEmitter } = require('events');
+          const ch = new EventEmitter();
+          ch.stdin = { write: (d, f) => f && f(), end() {} };
+          ch.stderr = new EventEmitter();
+          cb(null, ch);
+          setImmediate(() => { ch.emit('exit', 0); ch.emit('close', 0); });
+          return ch;
+        },
+      }),
+      configFile,
+    });
+    // First call fails once (channel error) then succeeds.
+    await b.runCommand('dev01', { command: 'true' });
+    const second = await b.runCommand('dev01', { command: 'true' });
+    assert.strictEqual(second.warning, undefined, 'stale warning leaked into a later call');
+  });
+  await checkAsync('array results are left alone (no bogus property)', async () => {
+    // listHosts returns an array; adding .warning to an array would be wrong.
+    const b = createBridge({ ...BASE_CFG, hosts: { a: { host: 'h', user: 'u' } } }, { configFile });
+    const r = b.listHosts();
+    assert.ok(Array.isArray(r));
+    assert.strictEqual(r.warning, undefined);
   });
 
   fs.rmSync(tmp, { recursive: true, force: true });
