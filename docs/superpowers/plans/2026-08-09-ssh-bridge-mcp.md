@@ -1,4 +1,8 @@
-# SSH Bridge MCP 实现计划
+# SSH Bridge MCP 实现计划（历史记录）
+
+> **2026-11-15 状态说明：本文件保留 2026-08-09 的原始实施步骤，不是当前运行契约，也不是待执行清单。** 文中的单连接、旧后台 PID/日志方案、`tests/` / smoke 路径、依赖版本和提交步骤可能已过时；不要据此恢复旧实现或执行提交。当前工具、超时/取消、无自动重放、托管任务恢复、非交互 session、文件暂存与转发语义见 [README](../../../README.md)，契约以 `src/server.js` 及实际模块为准。
+
+> 下列工作流提示属于原计划存档，不是当前任务指令。
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 

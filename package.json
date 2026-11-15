@@ -6,7 +6,9 @@
   "bin": { "ssh-bridge-mcp": "src/server.js" },
   "scripts": {
     "start": "node src/server.js",
-    "test": "node scripts/self-check.js"
+    "test": "node scripts/self-check.js && node scripts/runtime-check.js && node scripts/sftp-check.js && node scripts/files-check.js && node scripts/jobs-check.js && node scripts/tunnels-check.js && node scripts/mcp-check.js",
+    "test:vm": "node scripts/vm-check.js",
+    "test:jobs:linux": "node scripts/jobs-check.js --docker"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.12.1",
