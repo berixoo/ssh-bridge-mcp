@@ -95,6 +95,7 @@ function fakeSftp(source, { reportedSize, readError, fstatError, maxChunk } = {}
   const state = { opens: 0, closes: 0 };
   return {
     state,
+    stat(file, cb) { cb(null, { size: reportedSize === undefined ? source.length : reportedSize, mode: 0o100644 }); },
     open(file, flags, cb) { state.opens++; cb(null, 'handle'); },
     close(handle, cb) { state.closes++; cb(null); },
     fstat(handle, cb) {
@@ -520,10 +521,11 @@ async function main() {
   });
   await checkAsync('read_file refuses a file over the limit', async () => {
     const b = bridgeWith(sftpOnly(fakeSftp(Buffer.alloc(MAX_OUTPUT + 1, 0x41))));
-    await assert.rejects(() => b.readFile('dev01', '/big.log'), /not read completely/);
+    await assert.rejects(() => b.readFile('dev01', '/big.log'), { code: 'FILE_TOO_LARGE' });
   });
   await checkAsync('read_file surfaces a missing file as an error', async () => {
-    const sftp = { open: (f, fl, cb) => cb(Object.assign(new Error('No such file'), { code: 2 })) };
+    const missing = (f, cb) => cb(Object.assign(new Error('No such file'), { code: 2 }));
+    const sftp = { stat: missing, open: (f, fl, cb) => missing(f, cb) };
     await assert.rejects(() => bridgeWith(sftpOnly(sftp)).readFile('dev01', '/nope'), /No such file/);
   });
 
@@ -580,8 +582,10 @@ async function main() {
     assert.rejects(() => createBridge(BASE_CFG, noNet).upload('dev01', path.join(outsideDir, 's.txt'), '/tmp/x'), /outside the configured localRoots/));
   await checkAsync('upload refuses the config file with localRoots unset', () =>
     assert.rejects(() => createBridge({ ...BASE_CFG, localRoots: undefined }, noNet).upload('dev01', configFile, '/tmp/x'), /configuration file/));
-  await checkAsync('with no localRoots an outside path reaches the network layer', () =>
-    assert.rejects(() => createBridge({ ...BASE_CFG, localRoots: undefined }, noNet).upload('dev01', path.join(outsideDir, 'f.txt'), '/tmp/x'), /must not be reached/));
+  await checkAsync('with no localRoots an outside path reaches the network layer', () => {
+    fs.writeFileSync(path.join(outsideDir, 'f.txt'), 'fixture');
+    return assert.rejects(() => createBridge({ ...BASE_CFG, localRoots: undefined }, noNet).upload('dev01', path.join(outsideDir, 'f.txt'), '/tmp/x'), /must not be reached/);
+  });
   await checkAsync('download refuses an out-of-root local path', () =>
     assert.rejects(() => createBridge(BASE_CFG, noNet).download('dev01', '/etc/shadow', path.join(outsideDir, 'shadow')), /outside the configured localRoots/));
 
@@ -662,10 +666,10 @@ async function main() {
   });
   check('env exports survive sudo wrapping', () => {
     const c = makeExecCommand({ command: 'echo $FOO', sudo: true, env: { FOO: 'bar' } });
-    // The export is inside the quoted sh -c payload, so its quotes are escaped.
+    // The export is inside the quoted bash -c payload, so its quotes are escaped.
     assert.ok(c.includes('export FOO='), c);
     assert.ok(c.includes('bar'), c);
-    assert.ok(c.startsWith("sudo -S -p '' sh -c"), c);
+    assert.ok(c.startsWith("sudo -S -p '' bash -c"), c);
   });
   check('cwd is applied outside the sudo wrapper', () => {
     const c = makeExecCommand({ command: 'id', sudo: true, cwd: '/etc' });
@@ -790,8 +794,9 @@ async function main() {
           ch.stdin = { write: (d, f) => f && f(), end() {} };
           ch.stderr = new EventEmitter();
           cb(null, ch);
-          // First exec launches the job, second reads the pid file.
-          const out = /cat /.test(cmd) ? '4242\n' : '';
+          // Root discovery is separate from acknowledged supervisor launch.
+          const out = cmd.includes('SSH_BRIDGE_ROOT_V1') ? 'SSH_BRIDGE_ROOT_V1\0/home/u/.cache/ssh-bridge/jobs\0'
+            : cmd.includes("'\\''launch'\\''") ? 'SSH_BRIDGE_JOB_V1\trunning\t4242\t-\n' : '';
           setImmediate(() => {
             if (out) ch.emit('data', Buffer.from(out));
             ch.emit('exit', 0);
@@ -803,7 +808,7 @@ async function main() {
       configFile,
     });
     const r = await bridge.startBackground('dev01', { command: 'sleep 1', cwd: '/tmp' });
-    assert.ok(/^[0-9a-f]+$/.test(r.task_id), 'task_id must be present');
+    assert.ok(/^v1\.[A-Za-z0-9_-]+\.[0-9a-f]{24}$/.test(r.task_id), 'versioned task_id must be present');
     assert.strictEqual(r.taskId, r.task_id, 'taskId kept for compatibility');
     assert.ok(/^\d+$/.test(r.pid));
   });
@@ -1098,9 +1103,7 @@ async function main() {
     const r = await b.runCommand('dev01', { command: 'true' });
     assert.strictEqual(r.warning, undefined);
   });
-  await checkAsync('after a channel failure the next success warns that state was lost', async () => {
-    // The stub fails the first exec with a channel error, then succeeds; the
-    // bridge disposes and retries, and the result must say so.
+  await checkAsync('a rejected exec is not replayed; the next explicit call can use the healthy transport', async () => {
     let calls = 0;
     const b = createBridge(BASE_CFG, {
       clientFactory: () => ({
@@ -1121,10 +1124,12 @@ async function main() {
       }),
       configFile,
     });
+    await assert.rejects(b.runCommand('dev01', { command: 'true' }), /channel open failure/);
+    assert.strictEqual(calls, 1, 'failed request must not be silently replayed');
     const r = await b.runCommand('dev01', { command: 'true' });
     assert.strictEqual(r.exitCode, 0);
-    assert.ok(/re-established/.test(r.warning || ''), `expected a reconnect warning, got ${JSON.stringify(r.warning)}`);
-    assert.ok(/state .* is gone/.test(r.warning || ''), 'the warning must say state was lost, not just "reconnected"');
+    assert.strictEqual(calls, 2);
+    assert.strictEqual(r.warning, undefined, 'no shell state was lost on a healthy transport');
   });
   await checkAsync('the warning is emitted once, not on every later call', async () => {
     let calls = 0;
@@ -1146,7 +1151,7 @@ async function main() {
       }),
       configFile,
     });
-    // First call fails once (channel error) then succeeds.
+    // Healthy sequential calls must not acquire a stale recovery warning.
     await b.runCommand('dev01', { command: 'true' });
     const second = await b.runCommand('dev01', { command: 'true' });
     assert.strictEqual(second.warning, undefined, 'stale warning leaked into a later call');

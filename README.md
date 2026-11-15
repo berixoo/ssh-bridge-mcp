@@ -1,28 +1,27 @@
 # ssh-bridge-mcp
 
-让 Claude Code / Codex / Claude Desktop 通过 MCP 统一操作局域网 Linux 的 SSH 桥。本机常驻一个 MCP server（Node + `@modelcontextprotocol/sdk` + `ssh2`），把 SSH 封装成结构化工具；LLM 侧永远只看到工具与输出，看不到配置文件、看不到密码。
+让 Claude Code / Codex / Claude Desktop 通过 MCP 统一操作局域网 Linux 的 SSH 桥。本机运行一个 MCP server（Node + `@modelcontextprotocol/sdk` + `ssh2`），把任意 shell 命令、sudo、文件操作、截图、托管后台任务与本地 TCP 转发封装成结构化工具。
 
-```
+```text
 Claude Desktop / Claude Code / Codex
         |  MCP (stdio)
         v
-本机 Windows 上运行的 MCP server (Node + @modelcontextprotocol/sdk + ssh2)
-        |  SSH（密码来自本地配置）
+本机 MCP server（配置与凭据保留在本机）
+        |  SSH（密码 / 私钥 / 本机 agent）
         v
-多台远程 Linux（配置文件里列出）
+配置中的远程 Linux 主机
 ```
+
+**定位不变：可信局域网 + 本地虚拟机，不是沙箱。** 不增加命令白名单，不取消任意命令与 sudo，也不做凭据加密存储。工具不会主动列出凭据，但不能阻止具有其他本机文件访问能力的客户端读取配置。
 
 ## 快速开始
 
 1. `npm install`
-2. 复制 `config.example.json` 为 `config.json` 并填写主机与密码（`sudoPassword` 缺省同 `password`）
+2. 复制 `config.example.json` 为 `config.json`，只保留需要的主机条目，填写连接信息。最小密码配置如下：
 
    ```json
    {
      "default": "dev01",
-     "hostKeyPolicy": "insecure",
-     "localRoots": ["<allowed-local-dir>"],
-     "maxDownloadBytes": 2147483648,
      "hosts": {
        "dev01": {
          "host": "<remote-host-ip>",
@@ -35,11 +34,11 @@ Claude Desktop / Claude Code / Codex
    }
    ```
 
-3. 启动：`npm start`（或用 `SSH_BRIDGE_CONFIG=/path/to/config.json npm start` 指定配置路径）
+3. 启动：`npm start`。配置默认是项目根目录的 `config.json`，可用 `SSH_BRIDGE_CONFIG=/path/to/config.json npm start` 指定其他路径。
 
-配置文件默认在项目根目录 `config.json`，可用环境变量 `SSH_BRIDGE_CONFIG` 覆盖。配置文件内容在工具输出中永不出现。
+`sudoPassword` 缺省回落到 `password`。密码不是必填项：也可使用私钥或本机 SSH agent，见「[认证](#认证)」。
 
-`hostKeyPolicy` 与 `localRoots` 都是**可选**的加固项，默认关闭（自用局域网 + 本地虚拟机场景）。不想要就直接删掉那两行，见「[安全边界](#安全边界)」。`maxDownloadBytes` 默认 2 GiB，只在你要传更大的文件时才需要动。
+`hostKeyPolicy` 与 `localRoots` 是**可选加固**：默认分别为 `insecure` 与不限制本机路径，不想启用就不配置。示例文件中的 `localRoots` 是占位目录，需替换或删除。`maxDownloadBytes` 默认 2 GiB；`poolSize` 默认 4，`channelsPerConnection` 默认 6。
 
 ## 接入
 
@@ -66,195 +65,234 @@ claude mcp add ssh-bridge -- node <path-to>/ssh-bridge-mcp/src/server.js
 
 ## 工具
 
-本 server 面向**可信环境**（自用局域网 + 本地虚拟机），因此给了完整的操作能力：任意 shell 命令、sudo 提权、文件读写/搜索/删除、桌面截图。
+`host` 可省略，依次使用配置的 `default`、第一个主机。各工具可传 `timeout_ms`，默认命令 30 秒、截图 90 秒、其他操作 60 秒；这是包含连接、排队与执行的整次操作预算，不是每个子步骤各获一份预算。客户端取消请求也会触发清理。
 
 | 工具 | 作用 |
 |---|---|
-| `list_hosts` | 列出可用主机名与地址（不含任何凭据） |
-| `run_command` | 运行 shell 命令，返回 `{ exitCode, stdout, stderr }` |
-| `read_file` | 读远程文本文件（上限 500 KB，超了报错；大文件用 `download`） |
-| `write_file` | 写远程文本文件，自动建目录（面向文本/小文件；大文件用 `upload`） |
-| `list_dir` | 列远程目录（SFTP），返回名称/类型/大小/mtime/权限，目录排前 |
-| `search_files` | 远程搜索文件内容（优先 ripgrep，退回 grep -r），返回 `{file, line, text}` |
-| `rename` | 移动/重命名路径（SFTP），自动建目标父目录 |
-| `delete` | 删除文件/符号链接/空目录；`recursive: true` 删整棵树（链接只解除不跟随） |
-| `screenshot` | 截取远程桌面，**直接返回图片**给模型看 |
-| `upload` | 本机 -> Linux，SFTP 传文件（大文件/目录）。配了 `localRoots` 时本机路径须落在其中 |
-| `download` | Linux -> 本机，SFTP 传文件（大文件/目录）。超过 `maxDownloadBytes`（默认 2 GiB）拒绝；配了 `localRoots` 时本机路径须落在其中 |
-| `start_background` | 启动长驻进程（dev server、训练任务），返回 `task_id` |
-| `background_logs` | 读后台进程日志（增量，从上次读的位置起；`truncated: true` 表示还有，继续调） |
-| `stop_background` | 终止后台进程 |
+| `list_hosts` | 列出主机名、地址、端口与用户，不列凭据 |
+| `run_command` | 任意 shell 命令；返回 `exitCode`、`stdout`、`stderr`、`timedOut`、`truncated`，必要时含 `outcome` |
+| `read_file` | UTF-8 文本与 SHA-256；默认完整读取至多 500 KiB，也支持有界行范围、head/tail |
+| `write_file` | 写文本，自动建父目录；先暂存再提交 |
+| `patch_file` | 基于整文件哈希的唯一字面量替换，可 `dry_run` |
+| `list_dir` | SFTP 列目录，含名称、类型、大小、mtime、权限，目录排前 |
+| `search_files` | 优先 ripgrep、回退 grep；返回 `{file, line, text}`，无匹配不是错误 |
+| `rename` | SFTP 移动/重命名路径，自动建目标父目录 |
+| `delete` | 删文件、链接、空目录；`recursive: true` 删树，链接只解除不跟随 |
+| `screenshot` | 查找已登录图形会话，直接返回桌面图片 |
+| `upload` / `download` | SFTP 传输**单个文件，不支持目录**；本机路径受可选 `localRoots` 约束 |
+| `persistent_shell_close` | 关闭当前 host 的持久 bash，清空其 shell 状态 |
+| `start_background` | 启动可跨 MCP 重启恢复的托管任务，返回 `task_id` |
+| `background_logs` | 按字节游标读取有限量增量日志及任务状态 |
+| `stop_background` | 尽力终止托管任务；可显式清理已终态任务的远程文件 |
+| `list_background` | 从远程元数据恢复并列出托管任务，不把不可达误当完成 |
+| `open_tunnel` | 创建进程内本地 TCP 转发，默认仅监听 loopback |
+| `list_tunnels` / `close_tunnel` | 列出当前进程的转发 / 幂等关闭监听器及其流 |
 
-`run_command` 参数：`host` / `command` / `cwd` / `timeout_ms` / `sudo` / `pty` / `env` / `input` / `pipefail` / `session`。`host` 可省略，缺省连配置的默认主机。
+### 命令、取消与不确定结果
+
+`run_command` 参数包括 `command` / `cwd` / `env` / `input` / `sudo` / `pty` / `pipefail` / `session`，以及 `host`、`timeout_ms`。
+
+- 默认一次性 shell；支持多行脚本与 heredoc，`input` 一次性写入后关闭 stdin。
+- `sudo: true` 使用配置的 sudo 密码经 stdin 交给 `sudo -S`，不把密码放进远端命令行。`pty: true` 可为一次性命令申请终端，但不是持续交互接口。
+- `pipefail: true` 让管道任一段失败影响退出码；默认关闭，避免改变 `cmd | head` 的常用行为。
+- 非零退出码不是工具异常；检查 `exitCode`。输出有界，超出会标记 `truncated`。
+- **没有自动重试或自动重放**，包括 exec 打开被明确拒绝时也不重试。后续新调用可以复用仍健康的连接，或建立新连接，但不会补跑旧命令、文件修改或任务启动。
+- 连接在派发后断开，可能返回 `outcome: "unknown"` / `OUTCOME_UNKNOWN`；超时可能返回 `timedOut: true` 与 `termination: "best_effort"`。客户端取消或文件操作错误也不证明远端没有产生副作用。不要机械重试：先查文件、任务或业务状态。
+- 终止是尽力而为，不承诺杀死所有后代，也不保证回滚已经发生的修改。
 
 ### 持久 shell 会话
 
-默认每条命令是独立的：`cd /tmp` 之后下一条调用又回到 home，`export` 的东西也带不过去。传 `session: true` 则改用一个**长期存活的交互式 bash**，`cwd`、环境变量、shell 函数、alias 都跨调用保留：
+`session: true` 使用每 host 一个**串行、非 PTY、非交互的 bash**。`cwd`、环境变量与 shell 函数在同一存活会话中保留，不是 Python REPL 或密码提示等反复交互终端。
 
-```
+```text
 run_command(command="cd /project", session=true)
-run_command(command="pwd",         session=true)  -> /project
-run_command(command="export FOO=1",session=true)
-run_command(command="echo $FOO",   session=true)  -> 1
+run_command(command="pwd", session=true)                  -> /project
+run_command(command="export FOO=1; f() { echo $FOO; }", session=true)
+run_command(command="f", session=true)                    -> 1
+persistent_shell_close()
 ```
 
-用 `persistent_shell_close` 丢弃该 host 的会话（状态清零，下次重新开）。
+每次提交作为一个完整命令单元执行；用随机标记识别该单元的结束，而不是等待每一行的 shell prompt。多行命令不会在中间提示符处提前完成。`src/shell.js` 的旧交互式 `PROMPT_COMMAND` / OSC parser 是遗留代码，不是当前生产执行路径；这些标记也不是对不可信命令输出的安全隔离。
 
-**实现**用的是 **OSC 133**（FinalTerm 终端集成协议），不是「命令后 echo 一个哨兵再扫输出」。哨兵是混在数据流里的普通文本，`sudo`/`ssh` 首连/`mysql -p` 这类抢 stdin 的程序会把它当输入吃掉、命令挂到超时，大输出还可能把它挤出缓冲；OSC 133 的标记以 ESC 字节开头，普通文本伪造不出来。shell 侧只挂 `PROMPT_COMMAND` 打印 `ESC]133;D;<exit>BEL` 和 `ESC]133;A BEL`，**不用 DEBUG trap**（它每个命令和子 shell 各触发一次，实测会产生重复标记）。
+**限制**：session 模式拒绝 `sudo: true`、任何 `input` 和 `pty: true`，请改用一次性执行。断线、取消或显式关闭会丢失该 shell 的状态；恢复会话不恢复旧 cwd/env/functions。shell 状态丢失不表示独立托管任务也已结束。
 
-几个实现上的坑（都验证过）：
-- `$?` 必须先存进变量再 printf，否则报的是 hook 自己的退出码（`false` 会返回 0）。
-- 标记在 shell 源码里写成 `\033`，由 `printf` 运行时解释；直接嵌真 ESC 字节会被 PTY 行编辑器吃掉。
-- 开机脚本的回显里也含就绪标记的字符串，所以就绪判定要求该标记**独占一行**。
-- PTY 会回显命令本身，输出清洗时按行匹配去掉，多行命令的 `>` 续行提示一并处理。
+### 文件读取、补丁与提交边界
 
-**限制**：`session` 与 `sudo` 不兼容（交互式 shell 里 sudo 会吃掉命令边界），会明确报错而不是默默出错。
+`read_file` 不带范围时，最多完整读取 **500 KiB（512000 字节）**，返回 `content`、`sha256`、`hash_scope: "whole_file"`、`bytes`、`truncated: false`。过大报错，改用范围或下载。
 
+- 范围参数：`start_line` / `end_line`（从 1 开始，包含端点）、`head` 或 `tail`；head/tail 与行范围互斥。`max_bytes` 不超过 512000。
+- 读取预算同时约束扫描量，不会为寻找很远的行号而无限扫描。目标行超出扫描窗口可能返回空内容及 `truncated: true`；tail 只查看末尾的有限字节窗口，不能保证找到请求的全部行。
+- 范围结果含 `range`（字节区间左闭右开）、`scanned_bytes`、`next_offset`、`file_size` 与 `truncated`。`next_offset` 是本次扫描进度，不是另一个已公开的字节偏移输入参数。tail 窗口中无法确定绝对行号时返回 `null`。
+- `hash_scope: "range"` 只校验返回片段，**不能当作整文件版本**交给 `patch_file`；确实完整覆盖文件时才返回 `whole_file`。
+
+补丁示意：
+
+```text
+read_file(path="/project/app.js")
+patch_file(path="/project/app.js", expected_hash="<whole-file sha256>",
+           edits=[{old_text:"const n = 1;", new_text:"const n = 2;"}], dry_run=true)
+patch_file(path="/project/app.js", expected_hash="<same whole-file sha256>",
+           edits=[{old_text:"const n = 1;", new_text:"const n = 2;"}])
+```
+
+`patch_file` 要求文件是合法 UTF-8，原文件与结果都不超过文本读取上限。每个 `old_text` 必须在**原文件**恰好出现一次，各编辑不能重叠；不做模糊匹配，保留 BOM 与原有换行。整文件 SHA-256 不匹配会报 `FILE_CONFLICT`，提交前还会复核。`dry_run` 不写文件，返回拟议结果哈希。
+
+**哈希检查是乐观冲突检测，不是文件系统 compare-and-swap（CAS）**：最后一次检查与 rename 之间仍存在外部写入窗口。同一桥实例会串行化同 host / 规范化路径的 write、upload、patch，但不能锁住其他进程、其他 MCP 实例、路径别名或远端编辑器。
+
+写入与传输采用同目录随机暂存文件，校验暂存字节数后提交；下载也先写本机同目录暂存文件，再 rename 到目标。失败时尽力清理暂存文件；断连导致清理无法完成时可能留下 `.sshbridge-*.tmp`。
+
+- 远端覆盖已有文件要求 OpenSSH `posix-rename@openssh.com` 扩展；不支持时报 `ATOMIC_REPLACE_UNSUPPORTED`，**不先删除原文件来模拟覆盖**。新文件使用标准 SFTP rename。
+- 写目标的叶子为符号链接、目录或非普通文件会被拒绝；这是避免误覆盖，不是对远端恶意并发进程或父目录替换的隔离保证。
+- 提交保留已有目标的权限位，不保证保留 owner、ACL、扩展属性或硬链接身份。rename 的可见性不等于断电持久性：没有 fsync 事务保证，也不是目录树事务。
+- `upload` / `download` **只支持单个普通文件，不支持目录递归**。需要整目录时自行打包，再传单个归档。
+- 传输核对字节数，下载还核对远端前后大小；这不等于端到端内容哈希验证，也不能检测所有同长度并发修改。
+
+### 托管后台任务
+
+`start_background` 把命令、环境、日志与版本化元数据写入远端用户的 `~/.cache/ssh-bridge/jobs/`，由独立 supervisor 执行。依赖 Linux `/proc`、bash、`setsid`、`nohup` 等常用工具与文件系统硬链接能力，不需安装常驻服务。
+
+- `start_background(command, cwd?, env?, input?)` 返回 `task_id`（兼容 `taskId` 别名）。**不支持托管 sudo 标志**：`sudo: true` 明确拒绝；若远端权限策略允许，可在命令里显式使用非交互 `sudo -n ...`，桥不为此喂密码。也不支持 session、pty 或 pipefail 选项。
+- 日志在远端落盘，stdout/stderr 合并。**磁盘日志无大小上限，不自动轮转、不自动删除**，会占满磁盘；调用方负责监控空间和清理。
+- `background_logs(task_id, cursor?, limit?)` 返回 `content`、下一字节 `cursor`、`truncated` 与状态。`limit` 默认 65536 字节，允许 4..1048576；`truncated: true` 说明还有待读日志。未传 cursor 时使用当前 manager 的增量位置；重启后该隐式位置重置，要续读请保存并显式传回 cursor。
+- `list_background(host?, cursor?, limit?)` 从远端恢复任务；分页 cursor 是任务枚举偏移，不是日志字节偏移。任务 ID 包含配置中的 canonical host 名；重启后恢复要求保留相应主机名与远端用户/任务目录。
+- `running` / `succeeded` / `failed` / `stopped` 是可识别状态；失联、身份无法确认等情况返回 `status: "unknown"`、`running: null`，不是“已完成”。若启动回执丢失，不重复启动，先用列表或已有 ID 核对。
+- `stop_background(task_id, grace_ms?, cleanup?)` 校验启动时间、boot ID 与会话身份，再尝试 TERM，宽限后 KILL。默认宽限 2 秒，停止可重复调用；主动 daemonize / `setsid` 逃离原会话的后代不在可靠管控范围内，不是 cgroup 隔离。
+- 终态也保留日志与元数据。**显式调用 `stop_background(task_id, cleanup=true)` 才删除这些文件**；活动或 unknown 任务不能清理。清理前先取走需要的日志。
+- MCP 重启、SSH 断线或桥关闭不主动杀掉托管任务。其他 MCP 进程在使用相同 host 配置名、同一远端用户时也可恢复这些元数据；旧版仅内存 task ID 不属于此恢复协议。
+
+### 本地 TCP 转发
+
+```text
+open_tunnel(host="dev01", remote_host="127.0.0.1", remote_port=3000,
+            local_host="127.0.0.1", local_port=0)
+```
+
+返回 `tunnel_id`、`host`、`local_host`、实际 `local_port`、`remote_host`、`remote_port`。`local_port: 0` 自动选空闲端口，`remote_host` 与 `local_host` 默认均为 `127.0.0.1`；remote_host 从 SSH 服务端的网络环境解释。
+
+**仅当前 MCP 进程有效**，不是远端端口开放或持久代理。可显式绑定可信 LAN 地址或 `0.0.0.0`，但这会让其他能访问该地址的人通过监听端口访问远端服务，桥不会额外为流量增加认证。
+
+每条 TCP 流使用 ssh2 `forwardOut` 的 direct-tcpip，不占 sshd 的 `MaxSessions` session 配额；仍受服务端转发策略与资源限制。每条流的打开等待最多 15 秒，连接后双向 pipe 保留背压。绑定端口冲突报错而不关闭既有监听器；取消打开操作不遗留监听器。所属 SSH transport 失效会关闭监听器和流，**不重连重放流量、不跨重启恢复**，需显式重新打开。`close_tunnel(tunnel_id)` 幂等关闭监听器及其活动流。
 
 ### 截图
 
-`screenshot` 不需要你传 `DISPLAY`：它自己去 `loginctl` 找当前用户**已登录的图形会话**（远程 SSH 会话是 `tty` 类型，没有显示器，会被跳过），再按会话类型选工具：
+`screenshot` 自行通过 `loginctl` 找当前用户已登录的图形会话，不需传 `DISPLAY`，SSH 的 tty 会话不会当作图形桌面。
 
-- GNOME/Wayland → `gnome-screenshot` 走 Xwayland（配合 mutter 的 auth 文件）
-- wlroots/sway/KDE → `grim` / `spectacle`
-- X11 → `scrot` / `maim` / `imagemagick`
+- GNOME/Wayland：尝试 `gnome-screenshot` / Xwayland 路径。
+- wlroots/sway/KDE：尝试 `grim` / `spectacle`。
+- X11：尝试 `scrot` / `maim` / ImageMagick。
 
-每次尝试都有超时（`gnome-screenshot` 在其 D-Bus 路径失败后会无限挂住）。默认缩到 1600px、JPEG q82 再传：实测全屏 PNG 1.7 MB → 31 KB，耗时不变。要原图传 `max_width: 0`。
+工具须已安装，能否截图取决于桌面权限与 compositor；每次尝试有超时。默认缩到 1600px、JPEG q82，要原尺寸传 `max_width: 0`。特定桌面版本的既有实测不是所有系统的兼容保证。
 
-> 在 Ubuntu 24.04 + GNOME 46 上实测：`org.gnome.Shell.Screenshot` 的 D-Bus 调用被拒绝（GNOME 41+ 只允许本机会话），`grim` 报 compositor 不支持 wlroots 协议，`import` 读不到 X root；**只有 gnome-screenshot + Xwayland 可用**。这些失败原因写进了 [[GOTCHAS]]。
+### 连接与性能
 
-### 性能与稳定性
+每 host 懒加载连接池，`poolSize` 默认 4（1..16），`channelsPerConnection` 默认 6（1..8）。SFTP 会话和持久 shell 在其存活期间各占一个 session 配额；上限需与目标 sshd 配置协调。SFTP 按 host 复用，失败时丢弃；后续调用可重建，**当前操作不重放**。
 
-- **TCP_NODELAY**：ssh2 自建 socket 且不关 Nagle，Windows 上 Nagle + 延迟 ACK 让每次小往返卡 ~170 ms。现在自己建 socket 并 `setNoDelay(true)`，实测 40 次 `list_dir` 从 6810 ms 降到 **59 ms**。
-- **SFTP 会话复用**：每个 host 缓存一条 SFTP 会话（原来是每次调用新建），失败时丢弃并重建一次。20 个并发 `write_file` 只需 50 ms。
-- **TCP keepalive**：空闲连接每 30 s 探活，避免跨 agent 轮次被 NAT 掐断。
-
-- **并发池**：sshd 的 `MaxSessions`（默认 10）限制**单连接**的并发通道数，实测 OpenSSH 9.6 上第 11 个通道就开始失败。所以吞吐不能靠在一个连接上排队。现在每个 host 维护一个连接池（`poolSize`，默认 4），每条连接最多 6 个通道（`channelsPerConnection`，上限 8），按「最空闲」分配。SFTP 会话和持久 shell 长期各占一个通道，也计入对应连接的负载——旧实现开完 SFTP 就释放计数、却一直占着通道，是文件工具拖垮执行路径的原因。
-  实测（同 LAN）：128 并发从 46/128 成功提升到 **128/128**；64 并发耗时从 573 ms 降到 186 ms，32 并发 16.7ms/op → 4.0ms/op。
-- **重试退避**：通道类错误（含 ssh2 的 `Not connected`、`Unable to exec`、`No response from server`）会丢弃连接并以 100/200/400 ms 退避重建，最多 3 次。
-- **重连告警**：连接确实丢过并重建时，下一次成功的结果里会多一个 `warning` 字段，明确说明「连接曾断开重建，断开前的工作目录、环境变量、后台任务都已失效」。不告诉 Agent 的话，它会拿过期状态继续操作。
-- **`pipefail`**（可选）：`cat /etc/shadow | head -1` 默认会以 0 退出，把权限错误报成成功；传 `pipefail: true` 可让管道任一段失败即失败。默认关，因为会改变 `cmd | head` 的正常行为。
+连接使用 TCP_NODELAY、TCP keepalive 与 SSH keepalive。排队、连接和子步骤都受当前操作预算限制；TCP 连接与 SSH 握手另有各 15 秒上界。单个 transport 失效只清理其拥有的资源，不无条件清空整台 host。重连并不能恢复已丢失的持久 shell 状态，也不意味着独立后台任务已消失。
 
 ### 已知语义限制
 
-- **`read_file` 读 `/proc`、`/sys` 里的伪文件**：SFTP 子系统是独立进程，`/proc/self/*` 读到的是 `sftp-server` 自己，不是你的 shell。`fstat` 对这类文件报 `size=0`，现在会实际读一次直到 EOF（以前直接返回空），但内容归属仍是 sftp-server。要看 shell 自己的 `/proc/self/*` 请用 `run_command`。
-- **`delete` 符号链接**：用 `lstat` 判断，链接只解除、绝不跟随。删指向目录的链接返回 `removed: "link"`，目标目录不受影响。
+- `/proc/self/*` 经 SFTP 读到的是 `sftp-server`，不是执行命令的 shell。对于报告 size=0 的伪文件会尝试实际读取，但仍受大小预算；要观察 shell 自身请用 `run_command`。
+- `delete` 使用 `lstat`，符号链接只解除，目标目录不受影响；这不把任意远端 shell 变成受限文件系统。
 
+## 认证
 
+每 host 可配置 `password`、`privateKeyPath`、`passphrase`、`agent`，都不是必填。桥显式按以下优先级尝试可用方法：
+
+```text
+none -> privateKeyPath 对应的 publickey -> 本机 agent -> password
+```
+
+这是**桥的显式顺序，不是 ssh2 默认顺序**；未配置的方法跳过。`privateKeyPath` 相对配置文件目录解析，`passphrase` 用于加密私钥；文件不存在或无法读取会报错，不会偷偷忽略后直接降级到密码。`agent` 是本机 SSH agent socket 路径，Windows Pageant 可按 ssh2 约定配置 `"pageant"`；它不是远端 agent 路径，且不自动读取 `SSH_AUTH_SOCK` 代填。
+
+例如，用私钥时可将主机条目中的 `password` 换为 `"privateKeyPath": "./keys/dev_ed25519"`，按需另加 `passphrase`；用 agent 时可换为 `"agent": "<local-agent-socket-or-pageant>"`。**agent forwarding 固定关闭**，本机 agent 认证不等于把它转发给远端。没有 SSH 密码时若仍要 `sudo: true` 自动喂密码，需单独配置 `sudoPassword`。
+
+不引入凭据加密库或保险库；应依靠本机访问权限保护配置和私钥，不提交真实配置。
 
 ## 安全边界
 
-本项目默认面向**自用局域网 + 本地虚拟机**：两项校验默认关闭，不打扰开发。需要时按下面的开关打开，启动时若两项都没开会在 stderr 提示一次。
+本项目保留自用 LAN/VM 的宽松默认：不限制任意 shell 命令与 sudo，`hostKeyPolicy` 默认 `insecure`，`localRoots` 缺省不限制。两项加固都未启用时启动会在 stderr 提示一次，而不是启动失败。
 
 ### 主机密钥校验
 
-`ssh2` 在没有 `hostVerifier` 时**接受任意主机密钥**（见 ssh2 README：*Default: (auto-accept if hostVerifier is not set)*）——也就是谁在那个 IP 上应答，密码就交给谁。策略由 `hostKeyPolicy` 决定：
-
-| 取值 | 行为 |
+| `hostKeyPolicy` | 行为 |
 |---|---|
-| `insecure`（默认） | 不校验。README 已写明风险，不做任何额外动作 |
-| `tofu` | 首次连接记录密钥到 `known_hosts`，此后必须一致；不一致一律拒绝 |
-| `strict` | 必须已在 known_hosts 中，否则拒绝 |
+| `insecure`（默认） | 接受应答主机的密钥，无法抵御冒充目标主机 |
+| `tofu` | 首次记录，后续必须匹配；首次连接仍依赖网络可信 |
+| `strict` | 必须已有受信任密钥，否则拒绝 |
 
-`tofu` 与本地虚拟机重建这种场景是冲突的：VM 重建会换主机密钥，连接会被拒到你把那一行删掉。频繁重建的 VM 就别开，或者用 `hostKeyFingerprint` 钉。
-
-- 可信密钥存放于 `known_hosts`（OpenSSH 格式，默认在 `config.json` 同目录；`knownHosts` 可指定路径或路径数组，第一个是写入目标）。若 `~/.ssh/known_hosts` 存在，会一并**只读**参与匹配，所以你在 Git Bash 里连过的主机不用重新录。
-- `knownHosts` 和 `localRoots` 里的相对路径按 `config.json` 所在目录解析（不是进程 cwd——那个由拉起 server 的客户端决定）。
-- 预置密钥直接照抄 OpenSSH 的习惯：
-
-  ```bash
-  ssh-keyscan -p 22 <remote-host-ip> >> known_hosts
-  ```
-
-- 不想用 known_hosts 的话，按主机钉指纹：`"hostKeyFingerprint": "SHA256:..."`（`ssh-keygen -lf` 的输出）。这一项与 `hostKeyPolicy` 无关，配了就生效。
-- `@revoked` 条目会被硬拒；`@cert-authority` 不支持，也会被拒（不会偷偷降级成 tofu）。
-- 密钥变了就报错并列出新旧指纹：主机确实重装过，删掉 known_hosts 里那一行再连。
+- `knownHosts` 可为路径或数组，相对路径按配置文件目录解析；第一个是写入目标。默认使用配置目录的 `known_hosts`，存在的 `~/.ssh/known_hosts` 也只读参与匹配。
+- 可按主机配置 `hostKeyPolicy`；`hostKeyFingerprint: "SHA256:..."` 不受全局 insecure 开关影响，配置即校验。
+- VM 重建会换密钥；应核实后移除旧记录或更新固定指纹，不能把不匹配当成可自动重试故障。
+- `@revoked` 硬拒绝，`@cert-authority` 不支持，不静默降级。
+- 可用 `ssh-keyscan -p 22 <remote-host-ip> >> known_hosts` 收集密钥，**收集不等于认证**，需经可信渠道核对指纹。
 
 ### 本机路径边界
 
-`upload` / `download` 的本机路径由模型传入，没有边界时被 prompt injection 的 agent 可以把本机任意文件（含 `config.json` 里的明文密码）传到远程主机，或用 `download` 覆盖本机任意路径。`localRoots`（目录数组，可选）用来把范围圈住：
+`localRoots` 仅约束 upload/download 的本机路径：不配置即不限制，配置后解析真实路径、处理链接、拒绝 `..` 和同名前缀目录逃逸；Windows 比较不区分大小写。相对 roots 按配置文件目录解析。
 
-- **不配 = 不限制**（默认，开发时最省事）；配了就只允许这些目录。
-- 比较前先解析真实路径（symlink 逃不出去），Windows 下大小写不敏感，`..` 和同名前缀的兄弟目录都会被拒。
-- 配了不存在的目录会启动报错并列出实际解析到的绝对路径。
+配置了不存在的根目录时，**启动只警告，服务继续运行，不会因此启动失败**。实际传输仍按当时可解析的真实路径和 roots 边界检查；不要把启动警告当成文件系统隔离或目录已创建的保证。无论是否配置 roots，桥都拒绝传输配置文件本身。
 
-另外有一条**始终生效、不可关闭**：配置文件本身永远不可传输。它零成本（没人需要把自己的凭据库传到虚拟机上），且正好是上面那条泄露路径的入口。
+这些防线不等于完整隔离：任意命令能力、本机其他工具及恶意并发路径替换不在该传输检查的承诺范围内。
 
-### 传输大小上限
+### 下载上限与算法
 
-`download` 在传第一个字节之前先 `stat` 远端文件，超过 `maxDownloadBytes` 就拒绝，默认 **2 GiB**（`0` = 不限制）。这是防「远端把本机磁盘写满」，不是防大文件——50 MB ~ 1 GB 这类正常传输不受影响，实测 50 MB 文件约 47 MB/s 且逐字节一致。
+`maxDownloadBytes` 默认 2 GiB，`0` 表示不限制。下载前核对远端声明大小，读取也受已核验大小约束；超限报错，不应绕过配置盲目重试。需要更大文件可显式提高限额。
 
-拒了就把 `maxDownloadBytes` 调大；限额是配置项而不是硬编码，正是为了不挡住正当的大文件。传完还会核对本地文件字节数与远端声明的一致，写少了会报错而不是当成功返回。
+默认从 ssh2 的算法提议中移除 `ssh-rsa`（SHA-1 签名）与 `hmac-sha1` / `hmac-sha1-etm@openssh.com`。可用全局 `algorithms` 配置做列表覆盖或 append/prepend/remove；`allowLegacyAlgorithms: true` 恢复 ssh2 默认提议以兼容旧设备，不代表更安全。
 
-### 算法套件
+## 面向 agent 的常用组合
 
-ssh2 自己的默认提议列表**本来就是现代的**——CBC、3DES、arcfour、ssh-dss、sha1 系列密钥交换只在它的 "supported" 列表里，不主动提议。所以默认列表里唯一过时的东西是 SHA-1，本 server 把它减掉：
+```text
+# 环境变量与工作目录，不手拼密码
+run_command(command="npm test", cwd="/project", env={NODE_ENV:"test"})
 
-- `serverHostKey` 去掉 `ssh-rsa`（SHA-1 签名方案）
-- `hmac` 去掉 `hmac-sha1` 与 `hmac-sha1-etm@openssh.com`
+# 一次性 stdin / sudo，均不使用 session:true
+run_command(command="git commit -F -", input="feat: change\n\nDetails\n")
+run_command(command="journalctl -u myapp --no-pager -n 50", sudo=true)
 
-用的是 ssh2 的 `remove` 操作，从默认列表里做减法，所以 ssh2 的能力探测仍然生效，不会出现「请求了本机 crypto 不支持的算法」而直接抛错。实测发出去的 KEXINIT 为：
-
+# 长任务：保存 task_id 和日志 cursor
+start_background(command="npm run dev", cwd="/project")
+background_logs(task_id="<id>", cursor=0)
+stop_background(task_id="<id>")
+# 终态且日志已取走之后才清理
+stop_background(task_id="<id>", cleanup=true)
 ```
-serverHostKey: ssh-ed25519, ecdsa-sha2-nistp256, ecdsa-sha2-nistp384, ecdsa-sha2-nistp521, rsa-sha2-512, rsa-sha2-256
-mac          : hmac-sha2-256-etm@openssh.com, hmac-sha2-512-etm@openssh.com, hmac-sha2-256, hmac-sha2-512
+
+目录先通过任意命令自行打包，再用 upload/download 传单个文件。处理 `FILE_CONFLICT` 先重读整文件再重新构造补丁；遇到 unknown 先核对状态，不把重新连接视为可以重放操作的依据。
+
+## 验证
+
+默认入口不需要 VM，也不读取真实配置：
+
+```bash
+npm test
 ```
 
-- 要按主机自定义就写 `algorithms`（ssh2 的格式：精确数组，或 `append` / `prepend` / `remove` 对象；对象形式会与上面的减法合并，数组形式则整体替换该组）。
-- 遇到只支持 ssh-rsa 的老设备，写 `"allowLegacyAlgorithms": true` 恢复 ssh2 的完整默认提议。
+包含原有回归、执行/会话失败注入、SFTP 生命周期、文件、任务、隧道，以及真实 loopback SSH + MCP stdio 协议检查。仅使用临时测试配置、本机进程、fake transport / SFTP 与本机 socket；不会连接配置中的主机。持久 bash 测试需要本机 bash（可用 `SSH_BRIDGE_TEST_BASH` 指定路径）；缺失时仅该项明确打印 SKIP，其他检查继续。
 
-`sudoPassword` 缺省等于 `password`（见 `src/config.js`）：sudo 与 SSH 共用同一个密码时，一台主机失守就等于那台机器 root 失守。密码不同的话显式写 `sudoPassword`。
+额外的 Linux 任务生命周期检查使用本机已有的 Docker 镜像，不自动拉取：
 
+```bash
+npm run test:jobs:linux
+```
 
-## 使用说明（面向 agent）
+真机测试需显式设置 `SSH_BRIDGE_CONFIG`，再传配置中的主机名。以下为 Git Bash / POSIX shell 示例：
 
-本 MCP 的所有能力通过以下约定使用，避免命令拼接错误：
+```bash
+SSH_BRIDGE_CONFIG='/path/to/config.json' npm run test:vm -- ubuntu
+```
 
-### 1. 环境变量
+真机脚本只经配置加载器内部使用凭据，不打印配置内容；会创建随机临时目录、任务和隧道，结束时清理本轮工件。测试要求目标具备 bash、Linux `/proc`、setsid、sudo 配置和 Python 3。它验证本工作树源码，不代表正在运行的旧 MCP 进程已更新。桌面截图与其他目标文件系统的兼容性仍需另行验证；本机或单台 VM 通过不代表所有平台均兼容。
 
-- `env` 参数注入，不要手拼 `FOO=bar cmd` 或 `export FOO=bar && cmd`。
-  ```
-  run_command(command: "npm test", env: { NODE_ENV: "test", DEBUG: "1" })
-  ```
+## 调研来源（2026-11-15）
 
-### 2. 多行命令
+当前契约以本仓库实现与上述离线检查为准；外部项目仅用于了解设计取舍，**不是质量背书，也不表示 API 完全兼容**。
 
-- `command` 传多行字符串即脚本，作为单个参数交给 `bash -c` 执行，支持 heredoc。注意外层 shell 不保留 cd —— 多条命令用 `&&` 串联。
-  ```
-  run_command(command: "cd /app && npm ci && npm run build")
-  ```
-- heredoc 通过 `<<'EOF'` 避免变量展开：
-  ```
-  run_command(command: "cat > /tmp/x.sh <<'EOF'\necho keep_literal\nEOF\nbash /tmp/x.sh")
-  ```
+- [ssh-mcp](https://github.com/ErcinDedeoglu/ssh-mcp)：SSH 工具与持久会话的参考项目。
+- [portal-mcp-server](https://github.com/TMYTiMidlY/portal-mcp-server)：远端开发、状态化会话与哈希编辑的参考项目。
+- [MCP filesystem reference server](https://github.com/modelcontextprotocol/servers/tree/main/src/filesystem)：有界文本读取、编辑匹配与 dry-run 的另一组设计取舍。
+- [ssh2 README](https://github.com/mscdex/ssh2/blob/master/README.md) / [SFTP API](https://github.com/mscdex/ssh2/blob/master/SFTP.md)：认证、agent、forwardOut 与 SFTP 方法；桥的认证优先级由自身代码指定。
+- [TypeScript SDK 1.30.0 protocol 文档](https://github.com/modelcontextprotocol/typescript-sdk/blob/1.30.0/docs/protocol.md)：请求超时和 `extra.signal` 取消传递；取消通知本身不等于远端副作用回滚。
+- [OpenSSH PROTOCOL](https://github.com/openssh/openssh-portable/blob/master/PROTOCOL)：POSIX rename 与独立 fsync 扩展，勿把 rename 描述为 CAS 或持久化事务。
 
-### 3. sudo 提权
-
-- 需要 root 时设 `sudo: true`，server 自动喂密码。不要手写 `echo password | sudo`。
-  ```
-  run_command(command: "apt-get update && apt-get install -y python3", sudo: true)
-  ```
-
-### 4. 命令失败与超时
-
-- 命令非零退出**不会抛异常**，返回真实 exit code。检查 `exitCode` 而不是捕获异常。
-- 超过 `timeout_ms` 返回 timeout 状态，考虑拆短命令或改用 `start_background`。
-
-### 5. 文件操作
-
-- 文本/小文件：`read_file` / `write_file`（UTF-8，自动建目录）。`read_file` 上限 500 KB。
-- 大文件/二进制/整个目录：`upload` / `download`（SFTP 流式，路径不经 shell，无转义问题）。
-- 本地路径是本机 Windows 路径，远程路径是目标 Linux 路径，勿混淆。
-- 配了 `localRoots` 时本机路径必须在其中，越界会被拒绝——那是策略，不是权限故障，别改成别的路径重试。
-
-### 6. 长驻进程
-
-- dev server、训练等长驻任务用 `start_background`，返回 `task_id`，用 `background_logs` 增量看日志，`stop_background` 终止。
-- 后台进程池**仅限当前客户端进程**，Claude Desktop 起的进程 Codex 看不到。
-
-### 7. 常用开发组合（示意）
-
-- 跑测试：`run_command(command: "npm test", cwd: "/project")`
-- git 提交（多行消息）：`run_command(command: "git commit -F -", input: "feat: 新增 X\n\n- a\n- b")`
-- 查看日志：`run_command(command: "journalctl -u myapp --no-pager -n 50", sudo: true)`
-- 构建并部署：`run_command(command: "npm ci && npm run build && ./deploy.sh")`
+`docs/superpowers/` 中 2026-08-09 的设计与实施计划是历史记录，不是当前运行契约。

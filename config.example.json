@@ -3,6 +3,8 @@
   "hostKeyPolicy": "insecure",
   "localRoots": ["<allowed-local-dir>"],
   "maxDownloadBytes": 2147483648,
+  "poolSize": 4,
+  "channelsPerConnection": 6,
   "hosts": {
     "dev01": {
       "host": "<remote-host-ip>",
@@ -10,6 +12,20 @@
       "user": "<username>",
       "password": "<ssh-password>",
       "sudoPassword": "<sudo-password>"
+    },
+    "dev-key": {
+      "host": "<remote-host-ip>",
+      "port": 22,
+      "user": "<username>",
+      "privateKeyPath": "./keys/dev_ed25519",
+      "passphrase": "<private-key-passphrase>",
+      "sudoPassword": "<sudo-password>"
+    },
+    "dev-agent": {
+      "host": "<remote-host-ip>",
+      "port": 22,
+      "user": "<username>",
+      "agent": "<local-agent-socket-or-pageant>"
     }
   }
 }
